@@ -1,0 +1,39 @@
+system:
+  lattice_type: 2d_square
+  basis: sp_u
+  Nx: 1
+  Ny: 1
+  lattice_vectors:
+    - [1, 0, 0]
+    - [0, 0, 1]
+    - [0, 10, 0]
+
+hopping:
+  range: 1.5
+  tss: -0.5
+  tpp: 1.0
+  tsp: 0.7071067811865476    # 1/sqrt(2)
+  tsp_rashba: 0.0
+  tpp_rashba: 0.0
+
+onsite:
+  u_s: 10
+  u_p: 0
+  delta_s: 0.0
+  delta_p: 0.0
+  theta: 0
+  phi: 0
+  spinorbit: 0.0
+
+calc:
+  type: band_structure
+  kpath:
+    points:
+      Gamma: [0, 0, 0]
+      X: [0.5, 0, 0]
+      M: [0.5, 0, 0.5]
+    path: [Gamma, X, M, Gamma]
+    npoints: 100
+
+output:
+  file: test_bands
