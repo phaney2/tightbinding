@@ -9,6 +9,18 @@ Replaces the on-site section of constructHamiltonian_periodic_toy.m.
 import numpy as np
 from numpy.typing import NDArray
 
+from .types import OnsiteParams
+
+
+def build_onsite_8x8_from_params(params: OnsiteParams) -> NDArray:
+    """Build the full (8, 8) on-site Hamiltonian from an OnsiteParams object."""
+    return build_onsite_8x8(
+        params.u_s, params.u_p,
+        params.delta_s, params.delta_p,
+        params.theta, params.phi,
+        params.spinorbit,
+    )
+
 
 def build_onsite_8x8(u_s: float, u_p: float,
                      delta_s: float, delta_p: float,

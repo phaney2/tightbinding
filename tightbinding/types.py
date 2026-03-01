@@ -22,21 +22,15 @@ class Atom:
     """One atom in the unit cell."""
     index: int
     coord: NDArray[np.floating]         # Cartesian coordinates, shape (3,)
-    basis: str                          # e.g. 's_u', 'sp_ud', 'sj_ud'
+    basis: str                          # e.g. 's_u', 'sp_ud', 'sj_ud', 'spd'
     norb: int                           # number of active orbitals
     orb_slice: slice                    # slice into full Hamiltonian
-    pair: int = 0                       # which HoppingMatrix this atom belongs to
     species: str = ''                   # atom type label
 
-    # Hopping parameters (TB_simple)
-    tss: float = 0.0
-    tpp: float = 0.0
-    tsp: float = 0.0
-    tsp_rashba: float = 0.0
-    tpp_rashba: float = 0.0
-    hopping_range: float = 0.0
 
-    # On-site parameters
+@dataclass
+class OnsiteParams:
+    """On-site parameters for TB_simple (per species)."""
     u_s: float = 0.0
     u_p: float = 0.0
     delta_s: float = 0.0
@@ -44,6 +38,16 @@ class Atom:
     theta: float = 0.0
     phi: float = 0.0
     spinorbit: float = 0.0
+
+
+@dataclass
+class HoppingParams:
+    """Hopping parameters for TB_simple (per species)."""
+    tss: float = 0.0
+    tpp: float = 0.0
+    tsp: float = 0.0
+    tsp_rashba: float = 0.0
+    tpp_rashba: float = 0.0
 
 
 @dataclass
@@ -75,6 +79,8 @@ class System:
     norbs: int
     atompos: AtomPos | None = None
     neighbors: list[NeighborEntry] | None = None
+    onsite_params: dict[str, OnsiteParams] | None = None    # keyed by species
+    hopping_params: dict[str, HoppingParams] | None = None  # keyed by species
 
 
 @dataclass

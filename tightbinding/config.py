@@ -25,9 +25,16 @@ def _validate(cfg: dict) -> None:
             raise ValueError(f"Missing required config section: '{section}'")
 
     sys = cfg['system']
-    for key in ('lattice_type', 'basis', 'lattice_vectors'):
-        if key not in sys:
-            raise ValueError(f"Missing system.{key}")
+    if 'lattice_vectors' not in sys:
+        raise ValueError("Missing system.lattice_vectors")
+    if 'basis' not in sys:
+        raise ValueError("Missing system.basis")
+
+    # Must have either lattice_type or positions
+    if 'lattice_type' not in sys and 'positions' not in sys:
+        raise ValueError(
+            "system must have either 'lattice_type' or 'positions'"
+        )
 
     if 'type' not in cfg['calc']:
         raise ValueError("Missing calc.type")
@@ -38,6 +45,11 @@ def _convert_arrays(cfg: dict) -> None:
     sys = cfg['system']
     lv = sys['lattice_vectors']
     sys['lattice_vectors'] = np.array(lv, dtype=float)
+
+    # Convert position coords to numpy arrays
+    if 'positions' in sys:
+        for pos in sys['positions']:
+            pos['coord'] = np.array(pos['coord'], dtype=float)
 
     calc = cfg['calc']
     if 'nk' in calc:

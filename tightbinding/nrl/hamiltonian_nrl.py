@@ -55,7 +55,6 @@ def build_nrl_system(species_list: list[str], coords: NDArray,
             basis='spd',
             norb=NORBS_PER_ATOM,
             orb_slice=slice(i * NORBS_PER_ATOM, (i + 1) * NORBS_PER_ATOM),
-            pair=0,
             species=species_list[i],
         )
         atoms.append(atom)
@@ -323,7 +322,6 @@ def _spin_double_atoms(atoms):
             basis=a.basis,
             norb=2 * a.norb,
             orb_slice=slice(a.orb_slice.start, a.orb_slice.stop),  # just uu block
-            pair=a.pair,
             species=a.species,
         )
         result.append(new_atom)

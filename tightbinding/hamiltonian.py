@@ -9,10 +9,17 @@ from collections import defaultdict
 
 import numpy as np
 
-from .types import System
+from .types import System, OnsiteParams, HoppingParams
 from .basis import get_projector, project_matrix
 from .slater_koster import build_hopping_4x4, spin_double
-from .onsite import build_onsite_8x8
+from .onsite import build_onsite_8x8_from_params
+
+
+def _get_params(params_dict, species):
+    """Look up params by species, falling back to '_default'."""
+    if species in params_dict:
+        return params_dict[species]
+    return params_dict['_default']
 
 
 def fill_hamiltonian(system: System) -> None:
@@ -24,6 +31,8 @@ def fill_hamiltonian(system: System) -> None:
     """
     atoms = system.atoms
     neighbors = system.neighbors
+    onsite_p = system.onsite_params
+    hopping_p = system.hopping_params
 
     # Group neighbors by site_i
     nbrs_by_site = defaultdict(list)
@@ -35,16 +44,14 @@ def fill_hamiltonian(system: System) -> None:
         si = atom_i.orb_slice
 
         # On-site term (diagonal block in R=0 matrix)
-        H_onsite_full = build_onsite_8x8(
-            atom_i.u_s, atom_i.u_p,
-            atom_i.delta_s, atom_i.delta_p,
-            atom_i.theta, atom_i.phi,
-            atom_i.spinorbit,
-        )
+        osp = _get_params(onsite_p, atom_i.species)
+        H_onsite_full = build_onsite_8x8_from_params(osp)
         H_onsite = project_matrix(H_onsite_full, proj_i, proj_i)
         system.matrices[0].H[si, si] += H_onsite
 
         # Hopping terms from neighbor list
+        hp_i = _get_params(hopping_p, atom_i.species)
+
         for nb in nbrs_by_site[i]:
             j = nb.site_j
             atom_j = atoms[j]
@@ -54,12 +61,13 @@ def fill_hamiltonian(system: System) -> None:
             # Displacement vector from atom_i to atom_j + R
             d = nb.direction * nb.distance
 
-            # Average hopping parameters
-            tss = 0.5 * (atom_i.tss + atom_j.tss)
-            tsp = 0.5 * (atom_i.tsp + atom_j.tsp)
-            tpp = 0.5 * (atom_i.tpp + atom_j.tpp)
-            tsp_rashba = 0.5 * (atom_i.tsp_rashba + atom_j.tsp_rashba)
-            tpp_rashba = 0.5 * (atom_i.tpp_rashba + atom_j.tpp_rashba)
+            # Average hopping parameters between species
+            hp_j = _get_params(hopping_p, atom_j.species)
+            tss = 0.5 * (hp_i.tss + hp_j.tss)
+            tsp = 0.5 * (hp_i.tsp + hp_j.tsp)
+            tpp = 0.5 * (hp_i.tpp + hp_j.tpp)
+            tsp_rashba = 0.5 * (hp_i.tsp_rashba + hp_j.tsp_rashba)
+            tpp_rashba = 0.5 * (hp_i.tpp_rashba + hp_j.tpp_rashba)
 
             # Build (4,4) orbital hopping, then double to (8,8) spin space
             H_orb = build_hopping_4x4(d, tss, tsp, tpp, 0.0,
