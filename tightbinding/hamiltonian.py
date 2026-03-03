@@ -58,8 +58,9 @@ def fill_hamiltonian(system: System) -> None:
             proj_j = get_projector(atom_j.basis)
             sj = atom_j.orb_slice
 
-            # Displacement vector from atom_i to atom_j + R
-            d = nb.direction * nb.distance
+            # Direction vector for SK integrals: atom_i minus atom_j
+            # (MATLAB convention: d points FROM neighbor TOWARD home atom)
+            d = -nb.direction * nb.distance
 
             # Average hopping parameters between species
             hp_j = _get_params(hopping_p, atom_j.species)

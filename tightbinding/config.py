@@ -58,6 +58,8 @@ def _convert_arrays(cfg: dict) -> None:
         calc['ef'] = np.array(calc['ef'], dtype=float)
     if 'eflist' in calc:
         calc['eflist'] = np.array(calc['eflist'], dtype=float)
+    if 'omega1list' in calc:
+        calc['omega1list'] = np.array(calc['omega1list'], dtype=float)
 
     # kpath points
     if 'kpath' in calc:

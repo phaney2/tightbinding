@@ -4,7 +4,9 @@ Usage:
     python -m tightbinding input.yaml
 """
 
+import json
 import sys
+
 import numpy as np
 
 from .config import load_config
@@ -61,10 +63,69 @@ def _dispatch(system, cfg, calc_type):
         raise NotImplementedError("Quantum metric not yet implemented")
 
     elif calc_type == 'nonlinear_optical':
-        raise NotImplementedError("Nonlinear optical not yet implemented")
+        from .calc.nonlinear_optical import compute_nonlinear_optical
+        result = compute_nonlinear_optical(system, cfg)
+        _save_nonlinear_optical(result, cfg)
+        return result
 
     else:
         raise ValueError(f"Unknown calc_type: '{calc_type}'")
+
+
+def _save_nonlinear_optical(result, cfg):
+    """Save nonlinear optical results + config to .npz."""
+    output_file = cfg.get('calc', {}).get('outputfile')
+    if not output_file:
+        return
+
+    flat = {}
+    for chi_name, dirs in result.items():
+        for a, bd in dirs.items():
+            for b, cd in bd.items():
+                for c, arr in cd.items():
+                    flat[f"{chi_name}.{a}.{b}.{c}"] = arr
+
+    # Embed the full config as JSON string
+    def _make_serializable(obj):
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        if isinstance(obj, (np.integer,)):
+            return int(obj)
+        if isinstance(obj, (np.floating,)):
+            return float(obj)
+        return obj
+
+    cfg_serializable = json.loads(json.dumps(cfg, default=_make_serializable))
+    flat['_config_json'] = np.array(json.dumps(cfg_serializable))
+
+    np.savez(output_file, **flat)
+    print(f"Results saved to {output_file}.npz")
+
+
+def load_nonlinear_optical(path):
+    """Load nonlinear optical results from .npz.
+
+    Returns (result_dict, config_dict).
+    result_dict has structure result[chi_name][a][b][c] → array(nef, nomega).
+    """
+    if not path.endswith('.npz'):
+        path = path + '.npz'
+    data = np.load(path, allow_pickle=True)
+
+    cfg = json.loads(str(data['_config_json']))
+
+    result = {}
+    for key in data.files:
+        if key.startswith('_'):
+            continue
+        parts = key.split('.')
+        chi_name, a, b, c = parts
+        result.setdefault(chi_name, {})
+        result[chi_name].setdefault(a, {})
+        result[chi_name][a].setdefault(b, {})
+        result[chi_name][a][b][c] = data[key]
+
+    return result, cfg
 
 
 def _build_kpath(cfg) -> KPath:

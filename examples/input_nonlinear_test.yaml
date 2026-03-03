@@ -1,0 +1,24 @@
+system:
+  basis: sp_u
+  lattice_vectors: [[1,0,0],[0,0,1],[0,10,0]]
+  lattice_type: 2d_square
+  Nx: 1
+  Ny: 1
+hopping:
+  range: 1.5
+  tss: -0.5
+  tpp: 1.0
+  tsp: 0.7071067811865475
+  tpp_rashba: 0.2
+onsite:
+  u_s: 10.0
+  u_p: 0.0
+calc:
+  type: nonlinear_optical
+  nk: [6, 6]
+  omega1list: [1.5, 1.611111, 1.722222, 1.833333, 1.944444, 2.055556, 2.166667, 2.277778, 2.388889, 2.5]
+  omega2: 0.0
+  eta: 0.075
+  eflist: [5.0]
+  kT: 1.0e-7
+  directions: ['xzx', 'zxx']
