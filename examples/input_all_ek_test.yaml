@@ -1,0 +1,21 @@
+system:
+  basis: sp_u
+  lattice_vectors: [[1,0,0],[0,0,1],[0,10,0]]
+  lattice_type: 2d_square
+  Nx: 1
+  Ny: 1
+hopping:
+  range: 1.5
+  tss: -0.5
+  tpp: 1.0
+  tsp: 0.7071067811865475
+  tpp_rashba: 0.2
+onsite:
+  u_s: 10.0
+  u_p: 0.0
+calc:
+  type: all_ek
+  nk: [60, 60]
+  eflist: [2.0]
+  dos_bins: 200
+  outputfile: results/all_ek_test

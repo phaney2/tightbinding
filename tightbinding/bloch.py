@@ -8,9 +8,61 @@ v_a(k) = dH/dk_a = i * (R_a + atompos_a) .* H_R .* exp(i*k*(R+atompos))
 """
 
 import numpy as np
+import scipy.linalg as la
 from numpy.typing import NDArray
 
 from .types import System
+
+
+def get_reciprocal_lattice(unitcell_vectors):
+    """Compute reciprocal lattice vectors from real-space lattice vectors.
+
+    Parameters
+    ----------
+    unitcell_vectors : (3, 3) array-like, rows are a1, a2, a3
+
+    Returns
+    -------
+    b1, b2, b3 : each shape (3,)
+    """
+    a1, a2, a3 = unitcell_vectors
+    vol = abs(np.dot(a1, np.cross(a2, a3)))
+    b1 = 2 * np.pi * np.cross(a2, a3) / vol
+    b2 = 2 * np.pi * np.cross(a3, a1) / vol
+    b3 = 2 * np.pi * np.cross(a1, a2) / vol
+    return b1, b2, b3
+
+
+def diagonalize_hk(H, S, eigenvectors=False):
+    """Diagonalize H(k), handling generalized eigenvalue problem if S != I.
+
+    Parameters
+    ----------
+    H : (n, n) complex array — Hamiltonian (already Hermitianized by get_H_k)
+    S : (n, n) complex array — overlap matrix
+    eigenvectors : if True, return (eigenvalues, eigenvectors)
+
+    Returns
+    -------
+    ek : sorted eigenvalues (real)
+    psi : eigenvectors (columns), only if eigenvectors=True
+    """
+    dim = H.shape[0]
+    S_is_identity = np.allclose(S, np.eye(dim), atol=1e-10)
+
+    if eigenvectors:
+        if S_is_identity:
+            ek, psi = np.linalg.eigh(H)
+        else:
+            ek, psi = la.eigh(H, S)
+        idx = np.argsort(ek)
+        return ek[idx], psi[:, idx]
+    else:
+        if S_is_identity:
+            ek = la.eigh(H, eigvals_only=True)
+        else:
+            ek = la.eigh(H, S, eigvals_only=True)
+        return np.sort(ek)
 
 
 def get_H_k(system: System, k: NDArray) -> tuple[NDArray, NDArray]:

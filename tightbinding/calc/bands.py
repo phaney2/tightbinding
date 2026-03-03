@@ -6,10 +6,9 @@ data suitable for plotting.
 
 import numpy as np
 from numpy.typing import NDArray
-import scipy.linalg as la
 
 from ..types import System, KPath
-from ..bloch import get_H_k
+from ..bloch import get_H_k, get_reciprocal_lattice, diagonalize_hk
 
 
 def compute_band_structure(system: System, kpath: KPath) -> dict:
@@ -50,16 +49,7 @@ def compute_band_structure(system: System, kpath: KPath) -> dict:
 def _diag_at_k(system: System, k: NDArray) -> NDArray:
     """Diagonalize H(k) at one k-point, return sorted eigenvalues."""
     H, S = get_H_k(system, k)
-
-    # Check if S is identity (common case for TB_simple)
-    S_is_identity = np.allclose(S, np.eye(S.shape[0]))
-
-    if S_is_identity:
-        eigvals = la.eigh(H, eigvals_only=True)
-    else:
-        eigvals = la.eigh(H, S, eigvals_only=True)
-
-    return np.sort(eigvals.real)
+    return diagonalize_hk(H, S)
 
 
 def _interpolate_kpath(kpath: KPath, lattice_vectors: NDArray
@@ -78,11 +68,7 @@ def _interpolate_kpath(kpath: KPath, lattice_vectors: NDArray
     tick_positions : k-distance values at each high-symmetry point
     """
     # Compute reciprocal lattice vectors
-    a1, a2, a3 = lattice_vectors
-    vol = abs(np.dot(a1, np.cross(a2, a3)))
-    b1 = 2 * np.pi * np.cross(a2, a3) / vol
-    b2 = 2 * np.pi * np.cross(a3, a1) / vol
-    b3 = 2 * np.pi * np.cross(a1, a2) / vol
+    b1, b2, b3 = get_reciprocal_lattice(lattice_vectors)
 
     # Convert fractional k-points to Cartesian
     pts_cart = []

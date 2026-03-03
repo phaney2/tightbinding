@@ -12,7 +12,7 @@ from functools import partial
 import numpy as np
 from numpy.typing import NDArray
 
-from ..bloch import get_H_v
+from ..bloch import get_H_v, get_reciprocal_lattice, diagonalize_hk
 from ..types import System
 
 
@@ -103,10 +103,7 @@ def compute_nonlinear_optical(system: System, cfg: dict) -> dict:
             d[a][b][c] = np.zeros((nef, nomega), dtype=complex)
 
     # Reciprocal lattice vectors
-    a1, a2, a3 = system.unitcell_vectors
-    vol = abs(np.dot(a1, np.cross(a2, a3)))
-    b1 = 2 * np.pi * np.cross(a2, a3) / vol
-    b2 = 2 * np.pi * np.cross(a3, a1) / vol
+    b1, b2, _b3 = get_reciprocal_lattice(system.unitcell_vectors)
 
     db1 = b1 / (nk1 - 1)
     db2 = b2 / (nk2 - 1) if nk2 > 1 else np.zeros(3)
@@ -195,16 +192,8 @@ def _process_kpoint(
 
     H, S, vtb = get_H_v(system, k, order=2)
 
-    # Hermitianize and diagonalize
-    H = 0.5 * (H + H.conj().T)
-
-    # Check if S ≈ I
-    S_is_identity = np.allclose(S, np.eye(dim), atol=1e-10)
-    if S_is_identity:
-        ek, psi = np.linalg.eigh(H)
-    else:
-        from scipy.linalg import eigh as sp_eigh
-        ek, psi = sp_eigh(H, S)
+    # Diagonalize
+    ek, psi = diagonalize_hk(H, S, eigenvectors=True)
 
     # Energy difference matrix
     de_mtx = ek[:, None] - ek[None, :]  # de_mtx[n,m] = e_n - e_m
