@@ -13,6 +13,7 @@ from .config import load_config
 from .types import KPath
 from .lattice import build_system
 from .hamiltonian import fill_hamiltonian
+from . import parallel
 
 
 def _make_serializable(obj):
@@ -52,11 +53,13 @@ def main(config_path: str) -> dict:
     """
     cfg = load_config(config_path)
 
-    # Build system
-    system = build_system(cfg)
-
-    # Fill Hamiltonian
-    fill_hamiltonian(system)
+    # Build system on rank 0, broadcast to all ranks
+    if parallel.is_root():
+        system = build_system(cfg)
+        fill_hamiltonian(system)
+    else:
+        system = None
+    system = parallel.bcast(system)
 
     # Dispatch to calculation engine
     calc_type = cfg['calc']['type']
@@ -74,8 +77,8 @@ def _dispatch(system, cfg, calc_type):
         kpath = _build_kpath(cfg)
         result = compute_band_structure(system, kpath)
 
-        # Plot if not suppressed
-        if not cfg['calc'].get('no_plot', False):
+        # Plot if not suppressed (rank 0 only)
+        if parallel.is_root() and not cfg['calc'].get('no_plot', False):
             ax = plot_bands(result)
             import matplotlib.pyplot as plt
             title = cfg.get('output', {}).get('file', 'bands')
@@ -92,21 +95,24 @@ def _dispatch(system, cfg, calc_type):
     elif calc_type == 'quantum_metric':
         from .calc.quantum_metric import compute_quantum_metric
         result = compute_quantum_metric(system, cfg)
-        _save_quantum_metric(result, cfg)
+        if parallel.is_root():
+            _save_quantum_metric(result, cfg)
         return result
 
     elif calc_type == 'nonlinear_optical':
         from .calc.nonlinear_optical import compute_nonlinear_optical
         result = compute_nonlinear_optical(system, cfg)
-        _save_nonlinear_optical(result, cfg)
+        if parallel.is_root():
+            _save_nonlinear_optical(result, cfg)
         return result
 
     elif calc_type == 'all_ek':
         from .calc.all_ek import compute_all_ek, plot_all_ek
         result = compute_all_ek(system, cfg)
-        _save_all_ek(result, cfg)
-        output_file = cfg.get('calc', {}).get('outputfile', 'all_ek')
-        plot_all_ek(result, save_path=f"{output_file}.png")
+        if parallel.is_root():
+            _save_all_ek(result, cfg)
+            output_file = cfg.get('calc', {}).get('outputfile', 'all_ek')
+            plot_all_ek(result, save_path=f"{output_file}.png")
         return result
 
     else:

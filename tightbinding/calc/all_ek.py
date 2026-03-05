@@ -7,27 +7,11 @@ Auto-detects system dimensionality (1D/2D/3D) and produces:
   - band summary (edges, gap, van Hove singularities)
 """
 
-import os
-import multiprocessing as mp
-
 import numpy as np
 
 from ..bloch import get_H_k, get_reciprocal_lattice, diagonalize_hk
 from ..types import System
-
-
-# Module-level globals for multiprocessing
-_worker_system = None
-
-
-def _init_worker(system):
-    global _worker_system
-    _worker_system = system
-
-
-def _worker_kpoint(tk):
-    H, S = get_H_k(_worker_system, tk)
-    return diagonalize_hk(H, S)
+from .. import parallel
 
 
 def detect_dimensionality(system):
@@ -124,21 +108,19 @@ def compute_all_ek(system: System, cfg: dict) -> dict:
     total_jobs = len(k_list)
     nbands = system.norbs
 
-    # Diagonalize in parallel
-    ncpu = os.cpu_count() or 1
-    print(f"  All eigenvalues: {total_jobs} k-points, {nbands} bands, {ncpu} cores")
+    parallel.print_root(
+        f"  All eigenvalues: {total_jobs} k-points, {nbands} bands, "
+        f"{parallel.size} rank(s)"
+    )
 
-    if ncpu == 1 or total_jobs < 16:
-        all_ek = [diagonalize_hk(*get_H_k(system, tk)) for tk in k_list]
-    else:
-        with mp.Pool(ncpu, initializer=_init_worker, initargs=(system,)) as pool:
-            all_ek = list(pool.map(
-                _worker_kpoint, k_list,
-                chunksize=max(1, total_jobs // (4 * ncpu)),
-            ))
+    # Scatter k-points across MPI ranks
+    my_indices, my_klist = parallel.scatter_work(k_list)
 
-    # Reshape into grid
-    ek_flat = np.array(all_ek)  # (total_jobs, nbands)
+    # Each rank diagonalizes its subset
+    local_ek = np.array([diagonalize_hk(*get_H_k(system, tk)) for tk in my_klist])
+
+    # Gather all eigenvalues
+    ek_flat = parallel.gather_array(my_indices, local_ek, total_jobs)
 
     if ndim == 1:
         ekset = ek_flat.reshape(nk_list[0], nbands)
@@ -200,7 +182,8 @@ def compute_all_ek(system: System, cfg: dict) -> dict:
         'band_gap': band_gap,
     }
 
-    print_summary(result)
+    if parallel.is_root():
+        print_summary(result)
 
     return result
 

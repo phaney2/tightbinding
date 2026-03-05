@@ -119,11 +119,18 @@ def spin_double(H_orbital: NDArray) -> NDArray:
 # These operate on sub-blocks and are assembled by build_hopping_9x9.
 # =============================================================================
 
-def sd_hopping(d: NDArray, tvsd_s: float) -> tuple[NDArray, NDArray]:
+def sd_hopping(d: NDArray, tvsd_s: float, tsd_rashba: float = 0.0
+               ) -> tuple[NDArray, NDArray]:
     """s-d hopping.  Returns (sd, ds) blocks of shape (1,5) and (5,1).
 
     d-orbital order: dxy, dyz, dzx, dx2-y2, dz2
-    Note: s-d coupling is even under parity, so sd and ds use the same sign.
+    Standard s-d coupling is even under parity, so sd and ds use the same sign.
+
+    Rashba correction couples s to the z-odd d-orbitals (dyz, dzx) with
+    direction cosines perpendicular to each odd orbital's plane:
+      s-dyz: weighted by l (perp to yz)
+      s-dzx: weighted by m (perp to xz)
+    The Rashba part is antisymmetric: sd_R = -ds_R^T, ensuring H[i,j](d)=H[j,i](-d).
     """
     R = np.linalg.norm(d)
     l, m, n = d / R
@@ -136,17 +143,29 @@ def sd_hopping(d: NDArray, tvsd_s: float) -> tuple[NDArray, NDArray]:
     sd[0, 3] = s3 / 2 * (l**2 - m**2) * tvsd_s  # dx2-y2
     sd[0, 4] = (n**2 - 0.5 * (l**2 + m**2)) * tvsd_s  # dz2
 
-    ds = sd.T.copy()  # same sign (both even parity)
+    ds = sd.T.copy()  # standard part: same sign (both even parity)
+
+    # Rashba: couples s to z-odd d-orbitals, antisymmetric under orbital swap
+    sd[0, 1] += l * tsd_rashba      # s -> dyz
+    sd[0, 2] += m * tsd_rashba      # s -> dzx
+    ds[1, 0] -= l * tsd_rashba      # dyz -> s (opposite sign)
+    ds[2, 0] -= m * tsd_rashba      # dzx -> s (opposite sign)
 
     return sd, ds
 
 
-def pd_hopping(d: NDArray, tvpd_s: float, tvpd_p: float
-               ) -> tuple[NDArray, NDArray]:
+def pd_hopping(d: NDArray, tvpd_s: float, tvpd_p: float,
+               tpd_rashba: float = 0.0) -> tuple[NDArray, NDArray]:
     """p-d hopping.  Returns (pd, dp) blocks of shape (3,5) and (5,3).
 
     p-orbital order: px, py, pz
     d-orbital order: dxy, dyz, dzx, dx2-y2, dz2
+
+    Rashba correction couples all p-orbitals to the z-odd d-orbitals (dyz, dzx)
+    with direction cosines perpendicular to each odd orbital's plane:
+      p-dyz: weighted by l (perp to yz)
+      p-dzx: weighted by m (perp to xz)
+    The dp conjugate uses flipped direction cosines, giving automatic antisymmetry.
     """
     R = np.linalg.norm(d)
     l, m, n = d / R
@@ -205,14 +224,37 @@ def pd_hopping(d: NDArray, tvpd_s: float, tvpd_p: float
     dp[4, 1] = m2 * (n2**2 - 0.5*(l2**2 + m2**2)) * ts - s3 * m2 * n2**2 * tp
     dp[4, 2] = n2 * (n2**2 - 0.5*(l2**2 + m2**2)) * ts + s3 * n2 * (l2**2 + m2**2) * tp
 
+    # Rashba: couples all p to z-odd d (dyz=col1, dzx=col2)
+    tr = tpd_rashba
+    pd[0, 1] += l * tr       # px -> dyz
+    pd[0, 2] += m * tr       # px -> dzx
+    pd[1, 1] += l * tr       # py -> dyz
+    pd[1, 2] += m * tr       # py -> dzx
+    pd[2, 1] += l * tr       # pz -> dyz
+    pd[2, 2] += m * tr       # pz -> dzx
+    # dp conjugate: same formula with flipped cosines gives antisymmetric sign
+    dp[1, 0] += l2 * tr      # dyz -> px
+    dp[2, 0] += m2 * tr      # dzx -> px
+    dp[1, 1] += l2 * tr      # dyz -> py
+    dp[2, 1] += m2 * tr      # dzx -> py
+    dp[1, 2] += l2 * tr      # dyz -> pz
+    dp[2, 2] += m2 * tr      # dzx -> pz
+
     return pd, dp
 
 
-def dd_hopping(d: NDArray, tvdd_s: float, tvdd_p: float, tvdd_d: float
-               ) -> NDArray:
+def dd_hopping(d: NDArray, tvdd_s: float, tvdd_p: float, tvdd_d: float,
+               tdd_rashba: float = 0.0) -> NDArray:
     """d-d hopping.  Returns (5, 5) matrix.
 
     d-orbital order: dxy, dyz, dzx, dx2-y2, dz2
+
+    Rashba correction couples z-even d-orbitals {dxy(0), dx2-y2(3), dz2(4)}
+    to z-odd d-orbitals {dyz(1), dzx(2)} with direction cosines perpendicular
+    to each odd orbital's plane:
+      even-dyz: weighted by l (perp to yz)
+      even-dzx: weighted by m (perp to xz)
+    Antisymmetric under orbital swap: H[even,odd] = -H[odd,even].
     """
     R = np.linalg.norm(d)
     l, m, n = d / R
@@ -276,18 +318,37 @@ def dd_hopping(d: NDArray, tvdd_s: float, tvdd_p: float, tvdd_d: float
     # z2,z2
     H[4, 4] = (n**2-0.5*(l**2+m**2))**2*ts + 3*n**2*(l**2+m**2)*tp + 0.75*(l**2+m**2)**2*td
 
+    # Rashba: couples z-even to z-odd d-orbitals, antisymmetric
+    tr = tdd_rashba
+    # dxy(0) <-> dyz(1), dzx(2)
+    H[0, 1] += l * tr;    H[1, 0] -= l * tr
+    H[0, 2] += m * tr;    H[2, 0] -= m * tr
+    # dx2-y2(3) <-> dyz(1), dzx(2)
+    H[3, 1] += l * tr;    H[1, 3] -= l * tr
+    H[3, 2] += m * tr;    H[2, 3] -= m * tr
+    # dz2(4) <-> dyz(1), dzx(2)
+    H[4, 1] += l * tr;    H[1, 4] -= l * tr
+    H[4, 2] += m * tr;    H[2, 4] -= m * tr
+
     return H
 
 
 def build_hopping_9x9(d: NDArray, tvss_s: float, tvsp_s: float,
                       tvpp_s: float, tvpp_p: float,
                       tvsd_s: float, tvpd_s: float, tvpd_p: float,
-                      tvdd_s: float, tvdd_p: float, tvdd_d: float
-                      ) -> NDArray:
+                      tvdd_s: float, tvdd_p: float, tvdd_d: float,
+                      tsd_rashba: float = 0.0, tpd_rashba: float = 0.0,
+                      tdd_rashba: float = 0.0) -> NDArray:
     """Build the full (9, 9) hopping matrix in the NRL orbital basis.
 
     Orbital order: s, px, py, pz, dxy, dyz, dzx, dx2-y2, dz2
     No spin.
+
+    Optional Rashba parameters break z-mirror symmetry by coupling
+    z-even and z-odd orbitals:
+      tsd_rashba: s <-> {dyz, dzx}
+      tpd_rashba: {px, py, pz} <-> {dyz, dzx}
+      tdd_rashba: {dxy, dx2-y2, dz2} <-> {dyz, dzx}
     """
     H = np.zeros((9, 9), dtype=complex)
 
@@ -310,16 +371,16 @@ def build_hopping_9x9(d: NDArray, tvss_s: float, tvsp_s: float,
     H[1:4, 1:4] = pp_hopping(d, tvpp_s, tvpp_p, 0.0)
 
     # s-d (1x5) and d-s (5x1)
-    sd_block, ds_block = sd_hopping(d, tvsd_s)
+    sd_block, ds_block = sd_hopping(d, tvsd_s, tsd_rashba)
     H[0:1, 4:9] = sd_block
     H[4:9, 0:1] = ds_block
 
     # p-d (3x5) and d-p (5x3)
-    pd_block, dp_block = pd_hopping(d, tvpd_s, tvpd_p)
+    pd_block, dp_block = pd_hopping(d, tvpd_s, tvpd_p, tpd_rashba)
     H[1:4, 4:9] = pd_block
     H[4:9, 1:4] = dp_block
 
     # d-d (5x5)
-    H[4:9, 4:9] = dd_hopping(d, tvdd_s, tvdd_p, tvdd_d)
+    H[4:9, 4:9] = dd_hopping(d, tvdd_s, tvdd_p, tvdd_d, tdd_rashba)
 
     return H

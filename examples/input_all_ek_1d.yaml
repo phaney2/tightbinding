@@ -6,9 +6,9 @@ system:
   Ny: 1
 hopping:
   range: 1.5
-  tss: -0.5
-  tpp: 1.0
-  tsp: 0.7071067811865475
+  tss_sigma: -0.5
+  tsp_sigma: 0.7071067811865475
+  tpp_sigma: 1.0
   tpp_rashba: 0.0
 onsite:
   u_s: 10.0

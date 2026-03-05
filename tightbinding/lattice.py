@@ -57,18 +57,31 @@ def build_system(cfg: dict) -> System:
     onsite_params = {'_default': OnsiteParams(
         u_s=onsite_cfg.get('u_s', 0.0),
         u_p=onsite_cfg.get('u_p', 0.0),
+        u_d=onsite_cfg.get('u_d', 0.0),
         delta_s=onsite_cfg.get('delta_s', 0.0),
         delta_p=onsite_cfg.get('delta_p', 0.0),
+        delta_d=onsite_cfg.get('delta_d', 0.0),
         theta=onsite_cfg.get('theta', 0.0),
         phi=onsite_cfg.get('phi', 0.0),
         spinorbit=onsite_cfg.get('spinorbit', 0.0),
+        spinorbit_d=onsite_cfg.get('spinorbit_d', 0.0),
     )}
     hopping_params = {'_default': HoppingParams(
-        tss=hop_cfg.get('tss', 0.0),
-        tpp=hop_cfg.get('tpp', 0.0),
-        tsp=hop_cfg.get('tsp', 0.0),
+        tss_sigma=hop_cfg.get('tss_sigma', 0.0),
+        tsp_sigma=hop_cfg.get('tsp_sigma', 0.0),
+        tpp_sigma=hop_cfg.get('tpp_sigma', 0.0),
+        tpp_pi=hop_cfg.get('tpp_pi', 0.0),
+        tsd_sigma=hop_cfg.get('tsd_sigma', 0.0),
+        tpd_sigma=hop_cfg.get('tpd_sigma', 0.0),
+        tpd_pi=hop_cfg.get('tpd_pi', 0.0),
+        tdd_sigma=hop_cfg.get('tdd_sigma', 0.0),
+        tdd_pi=hop_cfg.get('tdd_pi', 0.0),
+        tdd_delta=hop_cfg.get('tdd_delta', 0.0),
         tsp_rashba=hop_cfg.get('tsp_rashba', 0.0),
         tpp_rashba=hop_cfg.get('tpp_rashba', 0.0),
+        tsd_rashba=hop_cfg.get('tsd_rashba', 0.0),
+        tpd_rashba=hop_cfg.get('tpd_rashba', 0.0),
+        tdd_rashba=hop_cfg.get('tdd_rashba', 0.0),
     )}
 
     system = System(

@@ -4,34 +4,16 @@ Ported from compute_quantum_metric.m — computes the quantum metric tensor Q
 and its intrinsic (dQ) and extrinsic (dQf) linear response over a 2D k-grid.
 """
 
-import os
-import multiprocessing as mp
+import warnings
 
 import numpy as np
 
 from ..bloch import get_H_v, get_reciprocal_lattice, diagonalize_hk
 from ..types import System
+from .. import parallel
 
-
-# Module-level globals for multiprocessing pool
-_worker_system = None
-_worker_params = None
 
 DEG_THR = 1e-5
-
-
-def _init_worker(system, params):
-    global _worker_system, _worker_params
-    _worker_system = system
-    _worker_params = params
-    import warnings
-    warnings.filterwarnings('ignore', category=RuntimeWarning)
-
-
-def _worker_kpoint(tk):
-    system = _worker_system
-    p = _worker_params
-    return _process_kpoint(system, tk, p)
 
 
 def compute_quantum_metric(system: System, cfg: dict) -> dict:
@@ -104,38 +86,54 @@ def compute_quantum_metric(system: System, cfg: dict) -> dict:
         'nef': nef,
     }
 
-    ncpu = os.cpu_count() or 1
-    print(f"  Quantum metric: {total_jobs} k-points on {ncpu} cores")
+    parallel.print_root(
+        f"  Quantum metric: {total_jobs} k-points on {parallel.size} rank(s)"
+    )
 
-    def _accumulate(kpt):
+    # Scatter k-points across MPI ranks
+    my_indices, my_klist = parallel.scatter_work(k_list)
+
+    # Local accumulators
+    local_Q = {}
+    local_dQ = {}
+    local_dQf = {}
+    for d1 in dir_chars:
+        local_Q[d1] = {}
+        local_dQ[d1] = {}
+        local_dQf[d1] = {}
+        for d2 in dir_chars:
+            local_Q[d1][d2] = np.zeros(nef, dtype=complex)
+            local_dQ[d1][d2] = {}
+            local_dQf[d1][d2] = {}
+            for d3 in dir_chars:
+                local_dQ[d1][d2][d3] = np.zeros(nef, dtype=complex)
+                local_dQf[d1][d2][d3] = np.zeros(nef, dtype=complex)
+
+    warnings.filterwarnings('ignore', category=RuntimeWarning)
+
+    for i, tk in enumerate(my_klist):
+        if parallel.is_root():
+            total_local = len(my_klist)
+            done = i + 1
+            if total_local >= 10 and (10 * done) % total_local == 0:
+                print(f"  k-point {done}/{total_local} on rank 0 "
+                      f"({100*done/total_local:.0f}%)")
+
+        kpt = _process_kpoint(system, tk, params)
         for d1 in dir_chars:
             for d2 in dir_chars:
-                Q[d1][d2] += kpt['Q'][d1][d2] * norm
+                local_Q[d1][d2] += kpt['Q'][d1][d2] * norm
                 for d3 in dir_chars:
-                    dQ[d1][d2][d3] += kpt['dQ'][d1][d2][d3] * norm
-                    dQf[d1][d2][d3] += kpt['dQf'][d1][d2][d3] * norm
+                    local_dQ[d1][d2][d3] += kpt['dQ'][d1][d2][d3] * norm
+                    local_dQf[d1][d2][d3] += kpt['dQf'][d1][d2][d3] * norm
 
-    if ncpu == 1:
-        for i, tk in enumerate(k_list):
-            if total_jobs >= 10 and (10 * (i + 1)) % total_jobs == 0:
-                print(f"  k-point {i+1}/{total_jobs} ({100*(i+1)/total_jobs:.0f}%)")
-            kpt = _process_kpoint(system, tk, params)
-            _accumulate(kpt)
-    else:
-        with mp.Pool(
-            processes=ncpu,
-            initializer=_init_worker,
-            initargs=(system, params),
-        ) as pool:
-            done = 0
-            for kpt in pool.imap_unordered(
-                _worker_kpoint, k_list,
-                chunksize=max(1, total_jobs // (4 * ncpu)),
-            ):
-                done += 1
-                if total_jobs >= 10 and (10 * done) % total_jobs == 0:
-                    print(f"  k-point {done}/{total_jobs} ({100*done/total_jobs:.0f}%)")
-                _accumulate(kpt)
+    # Reduce across all ranks
+    for d1 in dir_chars:
+        for d2 in dir_chars:
+            Q[d1][d2] = parallel.reduce_sum_complex_array(local_Q[d1][d2])
+            for d3 in dir_chars:
+                dQ[d1][d2][d3] = parallel.reduce_sum_complex_array(local_dQ[d1][d2][d3])
+                dQf[d1][d2][d3] = parallel.reduce_sum_complex_array(local_dQf[d1][d2][d3])
 
     return {'Q': Q, 'dQ': dQ, 'dQf': dQf}
 

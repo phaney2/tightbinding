@@ -1,0 +1,37 @@
+system:
+  basis: spd_u
+  lattice_vectors: [[1,0,0],[0,1,0],[0,0,1]]
+  lattice_type: 2d_square
+
+hopping:
+  range: 1.5
+  tss_sigma: -1.0
+  tsp_sigma: 0.8
+  tpp_sigma: 1.5
+  tpp_pi: -0.4
+  tsd_sigma: -0.5
+  tpd_sigma: -0.4
+  tpd_pi: 0.15
+  tdd_sigma: -0.3
+  tdd_pi: 0.15
+  tdd_delta: -0.02
+  tdd_rashba: 0.5
+
+onsite:
+  u_s: 7.0
+  u_p: 15.0
+  u_d: -2.0
+
+calc:
+  type: band_structure
+  kpath:
+    points:
+      G: [0.0, 0.0, 0.0]
+      Kz: [0.0, 0.0, 0.15]
+      Ky: [0.0, 0.15, 0.0]
+      Kx: [0.15, 0.0, 0.0]
+      G2: [0.0, 0.0, 0.0]
+      G3: [0.0, 0.0, 0.0]
+      G4: [0.0, 0.0, 0.0]
+    path: [G, Kz, G2, Ky, G3, Kx, G4]
+    npoints: 80

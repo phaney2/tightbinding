@@ -3,6 +3,10 @@
 Replaces constructHamiltonian_periodic_toy.m.  Iterates over the neighbor
 table, computes hopping and on-site contributions, projects to the active
 basis, and accumulates into the System's HoppingMatrix entries.
+
+Supports two full-space dimensions:
+  8-dim (sp×spin): uses build_hopping_4x4 + spin_double
+ 18-dim (spd×spin): uses build_hopping_9x9 + spin_double
 """
 
 from collections import defaultdict
@@ -10,9 +14,9 @@ from collections import defaultdict
 import numpy as np
 
 from .types import System, OnsiteParams, HoppingParams
-from .basis import get_projector, project_matrix
-from .slater_koster import build_hopping_4x4, spin_double
-from .onsite import build_onsite_8x8_from_params
+from .basis import get_projector, project_matrix, is_spd_basis
+from .slater_koster import build_hopping_4x4, build_hopping_9x9, spin_double
+from .onsite import build_onsite_8x8_from_params, build_onsite_18x18_from_params
 
 
 def _get_params(params_dict, species):
@@ -34,6 +38,16 @@ def fill_hamiltonian(system: System) -> None:
     onsite_p = system.onsite_params
     hopping_p = system.hopping_params
 
+    # Detect whether any atom uses spd basis
+    use_spd = any(is_spd_basis(atom.basis) for atom in atoms)
+
+    # Validate: don't mix sp and spd full-space dimensions
+    if use_spd and any(not is_spd_basis(a.basis) for a in atoms):
+        raise ValueError(
+            "Cannot mix sp-type and spd-type basis types in the same system. "
+            "All atoms must use the same full-space dimension."
+        )
+
     # Group neighbors by site_i
     nbrs_by_site = defaultdict(list)
     for nb in neighbors:
@@ -45,7 +59,10 @@ def fill_hamiltonian(system: System) -> None:
 
         # On-site term (diagonal block in R=0 matrix)
         osp = _get_params(onsite_p, atom_i.species)
-        H_onsite_full = build_onsite_8x8_from_params(osp)
+        if use_spd:
+            H_onsite_full = build_onsite_18x18_from_params(osp)
+        else:
+            H_onsite_full = build_onsite_8x8_from_params(osp)
         H_onsite = project_matrix(H_onsite_full, proj_i, proj_i)
         system.matrices[0].H[si, si] += H_onsite
 
@@ -64,15 +81,37 @@ def fill_hamiltonian(system: System) -> None:
 
             # Average hopping parameters between species
             hp_j = _get_params(hopping_p, atom_j.species)
-            tss = 0.5 * (hp_i.tss + hp_j.tss)
-            tsp = 0.5 * (hp_i.tsp + hp_j.tsp)
-            tpp = 0.5 * (hp_i.tpp + hp_j.tpp)
+            tss_s = 0.5 * (hp_i.tss_sigma + hp_j.tss_sigma)
+            tsp_s = 0.5 * (hp_i.tsp_sigma + hp_j.tsp_sigma)
+            tpp_s = 0.5 * (hp_i.tpp_sigma + hp_j.tpp_sigma)
+            tpp_p = 0.5 * (hp_i.tpp_pi + hp_j.tpp_pi)
             tsp_rashba = 0.5 * (hp_i.tsp_rashba + hp_j.tsp_rashba)
             tpp_rashba = 0.5 * (hp_i.tpp_rashba + hp_j.tpp_rashba)
 
-            # Build (4,4) orbital hopping, then double to (8,8) spin space
-            H_orb = build_hopping_4x4(d, tss, tsp, tpp, 0.0,
-                                      tsp_rashba, tpp_rashba)
+            if use_spd:
+                # Average d-orbital hopping parameters
+                tsd_s = 0.5 * (hp_i.tsd_sigma + hp_j.tsd_sigma)
+                tpd_s = 0.5 * (hp_i.tpd_sigma + hp_j.tpd_sigma)
+                tpd_p = 0.5 * (hp_i.tpd_pi + hp_j.tpd_pi)
+                tdd_s = 0.5 * (hp_i.tdd_sigma + hp_j.tdd_sigma)
+                tdd_p = 0.5 * (hp_i.tdd_pi + hp_j.tdd_pi)
+                tdd_d = 0.5 * (hp_i.tdd_delta + hp_j.tdd_delta)
+                tsd_r = 0.5 * (hp_i.tsd_rashba + hp_j.tsd_rashba)
+                tpd_r = 0.5 * (hp_i.tpd_rashba + hp_j.tpd_rashba)
+                tdd_r = 0.5 * (hp_i.tdd_rashba + hp_j.tdd_rashba)
+
+                # Build (9,9) orbital hopping, then double to (18,18) spin space
+                H_orb = build_hopping_9x9(
+                    d, tss_s, tsp_s, tpp_s, tpp_p,
+                    tsd_s, tpd_s, tpd_p,
+                    tdd_s, tdd_p, tdd_d,
+                    tsd_r, tpd_r, tdd_r,
+                )
+            else:
+                # Build (4,4) orbital hopping, then double to (8,8) spin space
+                H_orb = build_hopping_4x4(d, tss_s, tsp_s, tpp_s, tpp_p,
+                                          tsp_rashba, tpp_rashba)
+
             H_full = spin_double(H_orb)
 
             # Project to active basis

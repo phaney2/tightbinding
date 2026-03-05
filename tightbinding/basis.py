@@ -1,9 +1,12 @@
 """Orbital basis projectors.
 
-The full local Hilbert space is 8-dimensional:
-  [s_up, px_up, py_up, pz_up, s_down, px_down, py_down, pz_down]
+Two full-space dimensions are supported:
 
-Each basis type selects a subspace via a projection matrix P (8 x norb).
+ 8-dim (sp×spin): [s↑, px↑, py↑, pz↑, s↓, px↓, py↓, pz↓]
+18-dim (spd×spin): [s↑, px↑, py↑, pz↑, dxy↑, dyz↑, dzx↑, dx²−y²↑, dz²↑,
+                     s↓, px↓, py↓, pz↓, dxy↓, dyz↓, dzx↓, dx²−y²↓, dz²↓]
+
+Each basis type selects a subspace via a projection matrix P (full_dim x norb).
 The active Hamiltonian block is obtained as  P^T @ H_full @ P.
 
 Replaces getBasisVectors.m and get_norbs.m.
@@ -15,9 +18,10 @@ from numpy.typing import NDArray
 _SQRT3_INV = 1.0 / np.sqrt(3.0)
 _SQRT2_INV = 1.0 / np.sqrt(2.0)
 
+# ---- 8-dim (sp×spin) basis definitions ----
 # Each entry is a list of 8-element row vectors.  The projection matrix
 # is formed by transposing the stack, giving shape (8, norb).
-_BASIS_DEFS: dict[str, list[list[complex]]] = {
+_BASIS_DEFS_8: dict[str, list[list[complex]]] = {
     's_u': [
         [1, 0, 0, 0, 0, 0, 0, 0],
     ],
@@ -88,21 +92,56 @@ _BASIS_DEFS: dict[str, list[list[complex]]] = {
     ],
 }
 
+# ---- 18-dim (spd×spin) basis definitions ----
+# Order: [s↑, px↑, py↑, pz↑, dxy↑, dyz↑, dzx↑, dx²−y²↑, dz²↑,
+#          s↓, px↓, py↓, pz↓, dxy↓, dyz↓, dzx↓, dx²−y²↓, dz²↓]
+_Z18 = [0]*18
+
+def _e18(i):
+    """Unit vector of length 18 with a 1 at index i."""
+    v = [0]*18
+    v[i] = 1
+    return v
+
+_BASIS_DEFS_18: dict[str, list[list[complex]]] = {
+    'spd_u': [_e18(i) for i in range(9)],       # 9 orbs: s,p,d spin-up
+    'spd_ud': [_e18(i) for i in range(18)],      # 18 orbs: full spd×spin
+}
+
+# Combined lookup
+_BASIS_DEFS: dict[str, list[list[complex]]] = {**_BASIS_DEFS_8, **_BASIS_DEFS_18}
+
+# Set of basis names that use the 18-dim full space
+_SPD_BASES = set(_BASIS_DEFS_18.keys())
+
 # Cache compiled projectors
 _PROJECTOR_CACHE: dict[str, NDArray] = {}
 
 
-def get_projector(basis: str) -> NDArray:
-    """Return the (8, norb) projection matrix for the given basis type.
+def get_full_dim(basis: str) -> int:
+    """Return the full-space dimension for a basis type (8 or 18)."""
+    if basis in _SPD_BASES:
+        return 18
+    if basis in _BASIS_DEFS_8:
+        return 8
+    raise ValueError(f"Unknown basis type: '{basis}'")
 
-    Projects from the full 8-dim sp-spin space to the active subspace.
+
+def is_spd_basis(basis: str) -> bool:
+    """True if this basis uses the 18-dim spd×spin full space."""
+    return basis in _SPD_BASES
+
+
+def get_projector(basis: str) -> NDArray:
+    """Return the (full_dim, norb) projection matrix for the given basis type.
+
+    Projects from the full space (8-dim or 18-dim) to the active subspace.
     """
     if basis not in _PROJECTOR_CACHE:
         if basis not in _BASIS_DEFS:
             raise ValueError(f"Unknown basis type: '{basis}'")
         rows = np.array(_BASIS_DEFS[basis], dtype=complex)
-        # MATLAB: basis = transpose(basis) → columns become basis vectors
-        # rows is (norb, 8), transpose gives (8, norb)
+        # rows is (norb, full_dim), transpose gives (full_dim, norb)
         _PROJECTOR_CACHE[basis] = rows.T.copy()
     return _PROJECTOR_CACHE[basis]
 
@@ -113,7 +152,7 @@ def get_norbs(basis: str) -> int:
 
 
 def project_matrix(H_full: NDArray, proj_i: NDArray, proj_j: NDArray) -> NDArray:
-    """Project H from full 8-dim space to active subspaces.
+    """Project H from full space to active subspaces.
 
     H_active = proj_i^H @ H_full @ proj_j
     """

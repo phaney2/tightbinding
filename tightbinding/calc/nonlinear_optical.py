@@ -5,15 +5,14 @@ nonlinear optical response by summing contributions over a 2D k-grid using
 density-matrix perturbation theory (interband/intraband decomposition).
 """
 
-import os
-import multiprocessing as mp
-from functools import partial
+import warnings
 
 import numpy as np
 from numpy.typing import NDArray
 
 from ..bloch import get_H_v, get_reciprocal_lattice, diagonalize_hk
 from ..types import System
+from .. import parallel
 
 
 # 14 chi component names matching MATLAB
@@ -29,39 +28,6 @@ CHI_NAMES = [
 
 # Direction label → index
 _DIR = {'x': 0, 'y': 1, 'z': 2}
-
-# Module-level globals set by pool initializer
-_worker_system = None
-_worker_params = None
-
-
-def _init_worker(system, params):
-    """Initializer for pool workers — stores system and params as globals."""
-    global _worker_system, _worker_params
-    _worker_system = system
-    _worker_params = params
-    import warnings
-    warnings.filterwarnings('ignore', category=RuntimeWarning)
-
-
-def _worker_kpoint(tk):
-    """Worker function: process one k-point and return chi contributions."""
-    system = _worker_system
-    p = _worker_params
-
-    kpt = _process_kpoint(
-        system, tk, p['dim'], p['dir_chars'], p['directions'],
-        p['omega1list'], p['omega2_val'], p['omega2_mtx'],
-        p['eta_val'], p['eta_mtx'],
-        p['eflist'], p['kT'], p['nef'], p['nomega'],
-    )
-
-    # Flatten to a simple dict of arrays for efficient return
-    flat = {}
-    for name in CHI_NAMES:
-        for abc in p['directions']:
-            flat[f'{name}_{abc}'] = kpt[name][abc]
-    return flat
 
 
 def compute_nonlinear_optical(system: System, cfg: dict) -> dict:
@@ -127,58 +93,45 @@ def compute_nonlinear_optical(system: System, cfg: dict) -> dict:
     total_jobs = len(k_list)
     norm = 1.0 / (nk1 * nk2)
 
-    # Shared params for workers
-    params = {
-        'dim': dim,
-        'dir_chars': dir_chars,
-        'directions': directions,
-        'omega1list': omega1list,
-        'omega2_val': omega2_val,
-        'omega2_mtx': omega2_mtx,
-        'eta_val': eta_val,
-        'eta_mtx': eta_mtx,
-        'eflist': eflist,
-        'kT': kT,
-        'nef': nef,
-        'nomega': nomega,
-    }
+    parallel.print_root(
+        f"  Nonlinear optical: {total_jobs} k-points on {parallel.size} rank(s)"
+    )
 
-    ncpu = os.cpu_count() or 1
-    print(f"  Nonlinear optical: {total_jobs} k-points on {ncpu} cores")
+    # Scatter k-points across MPI ranks
+    my_indices, my_klist = parallel.scatter_work(k_list)
 
-    def _accumulate(flat):
+    # Each rank accumulates into local result arrays
+    local_result = {}
+    for name in CHI_NAMES:
+        for abc in directions:
+            local_result[f'{name}_{abc}'] = np.zeros((nef, nomega), dtype=complex)
+
+    warnings.filterwarnings('ignore', category=RuntimeWarning)
+
+    for i, tk in enumerate(my_klist):
+        if parallel.is_root() and total_jobs >= 10:
+            done = i + 1
+            total_local = len(my_klist)
+            if total_local >= 10 and (10 * done) % total_local == 0:
+                print(f"  k-point {done}/{total_local} on rank 0 "
+                      f"({100*done/total_local:.0f}%)")
+
+        kpt = _process_kpoint(
+            system, tk, dim, dir_chars, directions,
+            omega1list, omega2_val, omega2_mtx, eta_val, eta_mtx,
+            eflist, kT, nef, nomega,
+        )
         for name in CHI_NAMES:
             for abc in directions:
-                a, b, c = abc
-                result[name][a][b][c] += flat[f'{name}_{abc}'] * norm
+                local_result[f'{name}_{abc}'] += kpt[name][abc] * norm
 
-    if ncpu == 1:
-        # Serial fallback
-        for i, tk in enumerate(k_list):
-            if total_jobs >= 10 and (10 * (i + 1)) % total_jobs == 0:
-                print(f"  k-point {i+1}/{total_jobs} ({100*(i+1)/total_jobs:.0f}%)")
-            kpt = _process_kpoint(
-                system, tk, dim, dir_chars, directions,
-                omega1list, omega2_val, omega2_mtx, eta_val, eta_mtx,
-                eflist, kT, nef, nomega,
+    # Reduce across all ranks
+    for name in CHI_NAMES:
+        for abc in directions:
+            a, b, c = abc
+            result[name][a][b][c] = parallel.reduce_sum_complex_array(
+                local_result[f'{name}_{abc}']
             )
-            flat = {}
-            for name in CHI_NAMES:
-                for abc in directions:
-                    flat[f'{name}_{abc}'] = kpt[name][abc]
-            _accumulate(flat)
-    else:
-        with mp.Pool(
-            processes=ncpu,
-            initializer=_init_worker,
-            initargs=(system, params),
-        ) as pool:
-            done = 0
-            for flat in pool.imap_unordered(_worker_kpoint, k_list, chunksize=max(1, total_jobs // (4 * ncpu))):
-                done += 1
-                if total_jobs >= 10 and (10 * done) % total_jobs == 0:
-                    print(f"  k-point {done}/{total_jobs} ({100*done/total_jobs:.0f}%)")
-                _accumulate(flat)
 
     return result
 

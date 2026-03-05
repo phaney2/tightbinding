@@ -33,21 +33,34 @@ class OnsiteParams:
     """On-site parameters for TB_simple (per species)."""
     u_s: float = 0.0
     u_p: float = 0.0
+    u_d: float = 0.0
     delta_s: float = 0.0
     delta_p: float = 0.0
+    delta_d: float = 0.0
     theta: float = 0.0
     phi: float = 0.0
     spinorbit: float = 0.0
+    spinorbit_d: float = 0.0
 
 
 @dataclass
 class HoppingParams:
     """Hopping parameters for TB_simple (per species)."""
-    tss: float = 0.0
-    tpp: float = 0.0
-    tsp: float = 0.0
+    tss_sigma: float = 0.0
+    tsp_sigma: float = 0.0
+    tpp_sigma: float = 0.0
+    tpp_pi: float = 0.0
+    tsd_sigma: float = 0.0
+    tpd_sigma: float = 0.0
+    tpd_pi: float = 0.0
+    tdd_sigma: float = 0.0
+    tdd_pi: float = 0.0
+    tdd_delta: float = 0.0
     tsp_rashba: float = 0.0
     tpp_rashba: float = 0.0
+    tsd_rashba: float = 0.0
+    tpd_rashba: float = 0.0
+    tdd_rashba: float = 0.0
 
 
 @dataclass
