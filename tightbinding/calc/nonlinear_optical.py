@@ -10,7 +10,7 @@ import warnings
 import numpy as np
 from numpy.typing import NDArray
 
-from ..bloch import get_H_v, get_reciprocal_lattice, diagonalize_hk
+from ..bloch import get_H_v, get_H_k, get_reciprocal_lattice, diagonalize_hk
 from ..types import System
 from .. import parallel
 
@@ -50,6 +50,8 @@ def compute_nonlinear_optical(system: System, cfg: dict) -> dict:
     eflist = np.asarray(calc['eflist'], dtype=float)
     kT = float(calc['kT'])
     directions = calc['directions']  # e.g. ['xzx', 'zxx']
+    method = calc.get('method', 'sos')  # 'sos' or 'projector'
+    lam = float(calc.get('lam', 1e-4))  # finite-diff step for projector
 
     nomega = len(omega1list)
     nef = len(eflist)
@@ -93,8 +95,9 @@ def compute_nonlinear_optical(system: System, cfg: dict) -> dict:
     total_jobs = len(k_list)
     norm = 1.0 / (nk1 * nk2)
 
+    method_label = f"method={method}" + (f", lam={lam:.0e}" if method == 'projector' else "")
     parallel.print_root(
-        f"  Nonlinear optical: {total_jobs} k-points on {parallel.size} rank(s)"
+        f"  Nonlinear optical: {total_jobs} k-points on {parallel.size} rank(s) ({method_label})"
     )
 
     # Scatter k-points across MPI ranks
@@ -116,11 +119,23 @@ def compute_nonlinear_optical(system: System, cfg: dict) -> dict:
                 print(f"  k-point {done}/{total_local} on rank 0 "
                       f"({100*done/total_local:.0f}%)")
 
+        # SOS computation for all 14 components
         kpt = _process_kpoint(
             system, tk, dim, dir_chars, directions,
             omega1list, omega2_val, omega2_mtx, eta_val, eta_mtx,
             eflist, kT, nef, nomega,
         )
+
+        # Projector override for chi_e1/chi_e2
+        if method == 'projector':
+            chi_e_proj = _process_kpoint_projector_chi_e(
+                system, tk, dir_chars, directions,
+                omega1list, omega2_val, eta_val, eflist, kT, nef, nomega, lam,
+            )
+            for abc in directions:
+                kpt['chi_e1'][abc] = chi_e_proj[abc]['chi_e1']
+                kpt['chi_e2'][abc] = chi_e_proj[abc]['chi_e2']
+
         for name in CHI_NAMES:
             for abc in directions:
                 local_result[f'{name}_{abc}'] += kpt[name][abc] * norm
@@ -344,3 +359,194 @@ def _compute_dk_rmtx(v_a, v_b, vv_ab, Delta_a, Delta_b, de_mtx, inv_de, dim):
     result = np.where(np.isfinite(result), result, 0.0)
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# Projector-based chi_e1/chi_e2 (arXiv:2412.03637)
+# ---------------------------------------------------------------------------
+
+def _match_bands(psi_ref, psi_shifted):
+    """Match bands at shifted k to reference k via maximum overlap.
+
+    Returns permutation: assignment[n] = index in psi_shifted for band n.
+    """
+    dim = psi_ref.shape[1]
+    overlap = np.abs(psi_ref.conj().T @ psi_shifted) ** 2
+    assignment = np.full(dim, -1, dtype=int)
+    used = set()
+    flat_idx = np.argsort(overlap.ravel())[::-1]
+    for idx in flat_idx:
+        n, m = divmod(idx, dim)
+        if assignment[n] >= 0 or m in used:
+            continue
+        assignment[n] = m
+        used.add(m)
+        if len(used) == dim:
+            break
+    return assignment
+
+
+def _diag_and_form_projectors(system, k_shift, psi_ref):
+    """Diagonalize at shifted k, match bands, return list of projectors."""
+    H, S = get_H_k(system, k_shift)
+    ek, psi = diagonalize_hk(H, S, eigenvectors=True)
+    dim = len(ek)
+    assignment = _match_bands(psi_ref, psi)
+    psi_matched = psi[:, assignment]
+    return [np.outer(psi_matched[:, n], psi_matched[:, n].conj())
+            for n in range(dim)]
+
+
+def _compute_projector_derivs(system, k, dir_chars, lam=1e-4):
+    """Compute band projectors and 1st/2nd derivatives via finite differences.
+
+    Returns (ek, P, dP, d2P) where:
+        ek: eigenvalues at k
+        P[n]: projector for band n
+        dP[d][n]: first derivative ∂_d P_n
+        d2P[d1d2][n]: second derivative ∂_{d1}∂_{d2} P_n
+    """
+    dir_map = {'x': 0, 'y': 1, 'z': 2}
+
+    H0, S0 = get_H_k(system, k)
+    ek, psi0 = diagonalize_hk(H0, S0, eigenvectors=True)
+    dim = len(ek)
+
+    P = [np.outer(psi0[:, n], psi0[:, n].conj()) for n in range(dim)]
+
+    e_vec = {}
+    for d in dir_chars:
+        e = np.zeros(3)
+        e[dir_map[d]] = 1.0
+        e_vec[d] = e
+
+    # Projectors at k ± λ e_d
+    P_plus = {}
+    P_minus = {}
+    for d in dir_chars:
+        P_plus[d] = _diag_and_form_projectors(system, k + lam * e_vec[d], psi0)
+        P_minus[d] = _diag_and_form_projectors(system, k - lam * e_vec[d], psi0)
+
+    # Projectors for mixed second derivatives
+    P_pp = {}
+    P_pm = {}
+    P_mp = {}
+    P_mm = {}
+    for d1 in dir_chars:
+        for d2 in dir_chars:
+            if d1 >= d2:
+                continue
+            pair = d1 + d2
+            P_pp[pair] = _diag_and_form_projectors(
+                system, k + lam * (e_vec[d1] + e_vec[d2]), psi0)
+            P_pm[pair] = _diag_and_form_projectors(
+                system, k + lam * (e_vec[d1] - e_vec[d2]), psi0)
+            P_mp[pair] = _diag_and_form_projectors(
+                system, k - lam * (e_vec[d1] - e_vec[d2]), psi0)
+            P_mm[pair] = _diag_and_form_projectors(
+                system, k - lam * (e_vec[d1] + e_vec[d2]), psi0)
+
+    # First derivatives: central difference
+    dP = {}
+    for d in dir_chars:
+        dP[d] = [(P_plus[d][n] - P_minus[d][n]) / (2 * lam) for n in range(dim)]
+
+    # Second derivatives
+    d2P = {}
+    for d1 in dir_chars:
+        for d2 in dir_chars:
+            key = d1 + d2
+            if d1 == d2:
+                d2P[key] = [
+                    (P_plus[d1][n] - 2 * P[n] + P_minus[d1][n]) / lam**2
+                    for n in range(dim)
+                ]
+            elif d1 < d2:
+                pair = d1 + d2
+                d2P[key] = [
+                    (P_pp[pair][n] - P_pm[pair][n]
+                     - P_mp[pair][n] + P_mm[pair][n]) / (4 * lam**2)
+                    for n in range(dim)
+                ]
+            else:
+                pair = d2 + d1
+                d2P[key] = [
+                    (P_pp[pair][n] - P_mp[pair][n]
+                     - P_pm[pair][n] + P_mm[pair][n]) / (4 * lam**2)
+                    for n in range(dim)
+                ]
+
+    return ek, P, dP, d2P
+
+
+def _compute_C_mn(P, dP, d2P, n, m, alpha, beta, gamma):
+    """Compute C^{mn}_{α;βγ} from Eq. 31 of arXiv:2412.03637.
+
+    C^{mn}_{α;βγ} = tr[P_n (∂_β P_m) ((∂_α ∂_γ P_n) + (∂_α P_m)(∂_γ P_n))]
+    """
+    ag_key = alpha + gamma
+    term1 = P[n] @ dP[beta][m] @ d2P[ag_key][n]
+    term2 = P[n] @ dP[beta][m] @ (dP[alpha][m] @ dP[gamma][n])
+    return np.trace(term1 + term2)
+
+
+def _process_kpoint_projector_chi_e(
+    system, k, dir_chars, directions,
+    omega1list, omega2_val, eta_val, eflist, kT, nef, nomega, lam,
+):
+    """Compute chi_e1/chi_e2 at a single k-point using projector method.
+
+    Returns dict with chi_e1/chi_e2 for each direction triplet.
+    """
+    ek, P, dP, d2P = _compute_projector_derivs(system, k, dir_chars, lam)
+    dim = len(ek)
+
+    # Determine needed C^{mn} combinations
+    needed_C = set()
+    for abc in directions:
+        a, b, c = abc
+        needed_C.add((a, c, b))  # C^{mn}_{a;cb} for chi_e1
+        needed_C.add((a, b, c))  # C^{mn}_{a;bc} for chi_e2
+
+    C_cache = {}
+    for (alpha, beta, gamma) in needed_C:
+        key = (alpha, beta, gamma)
+        C_cache[key] = np.zeros((dim, dim), dtype=complex)
+        for n in range(dim):
+            for m in range(dim):
+                if n == m:
+                    continue
+                C_cache[key][n, m] = _compute_C_mn(
+                    P, dP, d2P, n, m, alpha, beta, gamma
+                )
+
+    de_mtx = ek[:, None] - ek[None, :]
+
+    chi_e = {}
+    for abc in directions:
+        chi_e[abc] = {
+            'chi_e1': np.zeros((nef, nomega), dtype=complex),
+            'chi_e2': np.zeros((nef, nomega), dtype=complex),
+        }
+
+    for efind, ef in enumerate(eflist):
+        x = (ek - ef) / kT
+        x_clip = np.clip(x, -500, 500)
+        f_arr = 1.0 / (1.0 + np.exp(x_clip))
+        f_mtx = f_arr[:, None] - f_arr[None, :]
+
+        for eind, omega1_val in enumerate(omega1list):
+            for abc in directions:
+                a, b, c = abc
+
+                # chi_e1: -Σ_{n≠m} C^{mn}_{a;cb} f_{nm} / (ω₂ - ε_{nm} - iη)
+                C_acb = C_cache[(a, c, b)]
+                denom1 = omega2_val - de_mtx - 1j * eta_val
+                chi_e[abc]['chi_e1'][efind, eind] = -np.sum(C_acb * f_mtx / denom1)
+
+                # chi_e2: -Σ_{n≠m} C^{mn}_{a;bc} f_{nm} / (ω₁ - ε_{nm} - iη)
+                C_abc = C_cache[(a, b, c)]
+                denom2 = omega1_val - de_mtx - 1j * eta_val
+                chi_e[abc]['chi_e2'][efind, eind] = -np.sum(C_abc * f_mtx / denom2)
+
+    return chi_e
