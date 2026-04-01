@@ -13,6 +13,7 @@ from numpy.typing import NDArray
 from ..bloch import get_H_v, get_H_k, get_reciprocal_lattice, diagonalize_hk
 from ..types import System
 from .. import parallel
+from .nonlinear_optical_fast import _process_kpoint_fast
 
 
 # 14 chi component names matching MATLAB
@@ -43,7 +44,10 @@ def compute_nonlinear_optical(system: System, cfg: dict) -> dict:
     dict with keys for each chi component, each a nested dict [a][b][c] → array(nef, nomega)
     """
     calc = cfg['calc']
-    nk1, nk2 = calc['nk']
+    nk_cfg = list(calc['nk'])
+    if len(nk_cfg) == 2:
+        nk_cfg.append(1)
+    nk1, nk2, nk3 = nk_cfg
     omega1list = np.asarray(calc['omega1list'], dtype=float)
     omega2_val = float(calc.get('omega2', 0.0))
     eta_val = float(calc['eta'])
@@ -71,10 +75,11 @@ def compute_nonlinear_optical(system: System, cfg: dict) -> dict:
             d[a][b][c] = np.zeros((nef, nomega), dtype=complex)
 
     # Reciprocal lattice vectors
-    b1, b2, _b3 = get_reciprocal_lattice(system.unitcell_vectors)
+    b1, b2, b3 = get_reciprocal_lattice(system.unitcell_vectors)
 
-    db1 = b1 / (nk1 - 1)
+    db1 = b1 / (nk1 - 1) if nk1 > 1 else np.zeros(3)
     db2 = b2 / (nk2 - 1) if nk2 > 1 else np.zeros(3)
+    db3 = b3 / (nk3 - 1) if nk3 > 1 else np.zeros(3)
 
     dim = len(system.matrices[0].H)
 
@@ -84,16 +89,26 @@ def compute_nonlinear_optical(system: System, cfg: dict) -> dict:
 
     # Build list of k-points
     k_list = []
-    for kc1 in range(1, nk1 - 1):
-        for kc2 in range(nk2):
-            tk = -b1/2 - b2/2 + db1 * kc1 + db2 * kc2
-            kx = tk[0]
-            if abs(kx + np.pi) < 1e-6 or abs(kx - np.pi) < 1e-6:
-                continue
-            k_list.append(tk)
+    if nk3 > 1:
+        # 3D grid: uniform sampling over full BZ
+        for kc1 in range(nk1):
+            for kc2 in range(nk2):
+                for kc3 in range(nk3):
+                    tk = (-b1/2 - b2/2 - b3/2
+                          + db1 * kc1 + db2 * kc2 + db3 * kc3)
+                    k_list.append(tk)
+    else:
+        # 2D grid: original behavior with boundary exclusion
+        for kc1 in range(1, nk1 - 1):
+            for kc2 in range(nk2):
+                tk = -b1/2 - b2/2 + db1 * kc1 + db2 * kc2
+                kx = tk[0]
+                if abs(kx + np.pi) < 1e-6 or abs(kx - np.pi) < 1e-6:
+                    continue
+                k_list.append(tk)
 
     total_jobs = len(k_list)
-    norm = 1.0 / (nk1 * nk2)
+    norm = 1.0 / (nk1 * nk2 * nk3)
 
     method_label = f"method={method}" + (f", lam={lam:.0e}" if method == 'projector' else "")
     parallel.print_root(
@@ -119,8 +134,8 @@ def compute_nonlinear_optical(system: System, cfg: dict) -> dict:
                 print(f"  k-point {done}/{total_local} on rank 0 "
                       f"({100*done/total_local:.0f}%)")
 
-        # SOS computation for all 14 components
-        kpt = _process_kpoint(
+        # SOS computation for all 14 components (vectorized over ef/omega)
+        kpt = _process_kpoint_fast(
             system, tk, dim, dir_chars, directions,
             omega1list, omega2_val, omega2_mtx, eta_val, eta_mtx,
             eflist, kT, nef, nomega,
@@ -166,9 +181,12 @@ def _process_kpoint(
     # Energy difference matrix
     de_mtx = ek[:, None] - ek[None, :]  # de_mtx[n,m] = e_n - e_m
 
-    # Safe inverse of de_mtx (set diagonal/degenerate to 0)
+    # Safe inverse of de_mtx (set near-degenerate pairs to 0).
+    # Cutoff at eta: bands closer than the broadening are effectively degenerate
+    # and their 1/de contributions would be unphysical artifacts.
+    de_cutoff = eta_val
     with np.errstate(divide='ignore', invalid='ignore'):
-        inv_de = np.where(np.abs(de_mtx) > 1e-12, 1.0 / de_mtx, 0.0)
+        inv_de = np.where(np.abs(de_mtx) > de_cutoff, 1.0 / de_mtx, 0.0)
 
     # Unique 2-char direction pairs needed
     dir_pairs = set()

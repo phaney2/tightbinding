@@ -94,6 +94,7 @@ class System:
     neighbors: list[NeighborEntry] | None = None
     onsite_params: dict[str, OnsiteParams] | None = None    # keyed by species
     hopping_params: dict[str, HoppingParams] | None = None  # keyed by species
+    orbital_position: dict[str, NDArray] | None = None  # a^(W,a) matrices, keyed by 'x','y','z'
 
 
 @dataclass

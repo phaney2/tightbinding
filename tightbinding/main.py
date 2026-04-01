@@ -106,6 +106,13 @@ def _dispatch(system, cfg, calc_type):
             _save_nonlinear_optical(result, cfg)
         return result
 
+    elif calc_type == 'delta_Q':
+        from .calc.delta_Q import compute_delta_Q
+        result = compute_delta_Q(system, cfg)
+        if parallel.is_root():
+            _save_delta_Q(result, cfg)
+        return result
+
     elif calc_type == 'all_ek':
         from .calc.all_ek import compute_all_ek, plot_all_ek
         result = compute_all_ek(system, cfg)
@@ -174,6 +181,47 @@ def load_quantum_metric(path):
     """
     data, cfg = _load_npz(path)
     result = {'Q': {}, 'dQ': {}, 'dQf': {}}
+    for key in data.files:
+        if key.startswith('_'):
+            continue
+        parts = key.split('.')
+        qty_name = parts[0]
+        if len(parts) == 3:
+            _, d1, d2 = parts
+            result[qty_name].setdefault(d1, {})
+            result[qty_name][d1][d2] = data[key]
+        elif len(parts) == 4:
+            _, d1, d2, d3 = parts
+            result[qty_name].setdefault(d1, {})
+            result[qty_name][d1].setdefault(d2, {})
+            result[qty_name][d1][d2][d3] = data[key]
+    return result, cfg
+
+
+def _save_delta_Q(result, cfg):
+    """Save delta Q results + config to .npz."""
+    output_file = cfg.get('calc', {}).get('outputfile')
+    flat = {}
+    for qty_name in ('Q_tilde', 'delta_Q'):
+        qty = result[qty_name]
+        for d1, v1 in qty.items():
+            for d2, v2 in v1.items():
+                if isinstance(v2, np.ndarray):
+                    flat[f"{qty_name}.{d1}.{d2}"] = v2
+                else:
+                    for d3, arr in v2.items():
+                        flat[f"{qty_name}.{d1}.{d2}.{d3}"] = arr
+    _save_npz(output_file, flat, cfg)
+
+
+def load_delta_Q(path):
+    """Load delta Q results from .npz.
+
+    Returns (result_dict, config_dict).
+    result_dict has keys 'Q_tilde', 'delta_Q'.
+    """
+    data, cfg = _load_npz(path)
+    result = {'Q_tilde': {}, 'delta_Q': {}}
     for key in data.files:
         if key.startswith('_'):
             continue

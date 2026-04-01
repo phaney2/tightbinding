@@ -22,6 +22,7 @@ tightbinding/
     all_ek.py             — full BZ eigenvalues + DOS
     nonlinear_optical.py  — chi^(2) nonlinear optical susceptibility
     quantum_metric.py     — quantum metric tensor + linear response
+    delta_Q.py            — DC field-induced change in quantum geometric tensor
   nrl/
     params.py          — NRL parameter file parser
     hamiltonian_nrl.py — NRL Hamiltonian builder (density-dependent on-site, SOC)
@@ -49,12 +50,32 @@ mpiexec -np 4 python -m tightbinding input.yaml
 - `examples/input_nonlinear_test.yaml` — chi^(2) (2D square sp_u, validated against MATLAB)
 - `examples/input_qm_test.yaml` — quantum metric (validated against MATLAB)
 - `examples/input_all_ek_test.yaml` — full BZ eigenvalues + DOS
+- `examples/input_delta_Q_test.yaml` — delta Q (2D square sp_u with Rashba)
 
 ## Validated Benchmarks
 - Pt NRL band structure: exact match with MATLAB (hopping_range=16.0, SOC on)
 - TB_simple 1D chain: verified
 - Nonlinear optical chi^(2): all 14 components match MATLAB to ~1e-13 relative error
 - Quantum metric Q, dQ, dQf: match MATLAB to ~1e-12
+
+## Delta Q Engine
+DC field-induced change in the quantum geometric tensor, `delta_Q.py`. Implements the corrected projector formula with three terms:
+- **T_Sipe**: dressed-dipole term using generalized derivatives r^{c;a} via Sipe sum rule
+- **T_Delta**: velocity-difference term
+- **T_3band**: three-band virtual transition term (fully vectorized via matrix products)
+
+Output is Sum_n f_n * dQ^{ab}_n accumulated over the k-grid. Config:
+```yaml
+calc:
+  type: delta_Q
+  components: [xz, zx]     # explicit (a,b) pairs, or 'all'
+  field_direction: x        # DC field direction c (string or list)
+  directions: [x, z]        # only needed when components='all'
+  nk: [60, 60]
+  eflist: [2.0]
+  kT: 0.1
+```
+Uses `_compute_dk_rmtx` (Sipe sum rule) borrowed from `nonlinear_optical.py`. Sign convention: code uses chi-convention rmtx = -i*v/w internally; PDF convention r = +i*v/w = -rmtx. Products of two r's have signs cancel. Reference: `corrected_projector_delta_Q_summary_typeset.pdf` (Section 3).
 
 ## MATLAB Source Reference
 Original MATLAB code is in `C:\Users\haney\master_response\` for comparison when porting.
