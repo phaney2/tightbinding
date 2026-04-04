@@ -1,27 +1,30 @@
-"""DC field-induced change in the quantum geometric tensor delta Q^{ab}_n.
+r"""DC field-induced change in the quantum geometric tensor delta Q^{ab}_n.
 
-Implements the corrected projector formula (Section 3 of corrected notes):
+Implements Eq. 40 of revised_formula_sheet_eta.pdf with adiabatic iη:
 
-  dQ^{ab}_n = Sum_{m!=n} [r^{c;a}_{nm} r^b_{mn} + r^a_{nm} r^{c;b}_{mn}] / w_{nm}
-            + Sum_{m!=n} [r^c_{nm} r^b_{mn} D^a_{mn} + r^a_{nm} r^c_{mn} D^b_{mn}] / w^2_{nm}
-            - Sum_{m!=n} Sum_{l!=n,m} [v^c_{nl} v^a_{lm} v^b_{mn} / (w^2_{nl} w_{lm} w_{nm})
-                                      + v^a_{nm} v^c_{ln} v^b_{ml} / (w_{nm} w^2_{nl} w_{lm})]
+  dQ^{ab}_n(η) = -Sum_{m!=n} r^{c;a}_{nm} v^b_{mn} / [(w_{nm}+iη) w_{nm}]
+                 -Sum_{m!=n} r^c_{nm} D^a_{mn} v^b_{mn} / [(w_{nm}+iη)^2 w_{nm}]
+                 -Sum_{m!=n} v^a_{nm} r^{c;b}_{mn} / [w_{nm} (w_{nm}-iη)]
+                 -Sum_{m!=n} v^a_{nm} r^c_{mn} D^b_{mn} / [w_{nm} (w_{nm}-iη)^2]
+                 -Sum_{m!=n} Sum_{l!=n,m} [ r^c_{nl} v^a_{lm} v^b_{mn}
+                                            / ((w_{nl}+iη) w_{lm} w_{nm})
+                                          + r^c_{ln} v^a_{nm} v^b_{ml}
+                                            / ((w_{nl}-iη) w_{nm} w_{lm}) ]
 
-where c is the DC field direction and all generalized derivatives r^{c;a}_{nm}
-are evaluated via Sipe's sum rule.
-
-The output is Sum_n f_n * dQ^{ab}_n, summed over bands with Fermi occupation
-and accumulated over the k-grid.
+The iη enters only the first-order state-mixing denominators (from the DC
+perturbation).  Denominators from the unperturbed projector derivatives
+(v/w terms) remain bare.  The +iη/−iη split preserves Hermiticity of δP_n.
 
 Config keys (under cfg['calc']):
   components:      list of 2-char (a,b) pairs, e.g. ['xz', 'zx'], or 'all'
   field_direction: DC field direction c, e.g. 'x' or ['x', 'z']
   directions:      list of direction chars, only needed when components='all'
   nk, eflist, kT:  standard grid/Fermi parameters
+  eta:             adiabatic broadening η (default 0.0)
 
 Notation:
   w_{nm} = E_n - E_m
-  r^a_{nm} = i v^a_{nm} / w_{nm}  (interband position, n != m)
+  r^a_{nm} = -i v^a_{nm} / w_{nm}  (interband position, n != m)
   D^a_{mn} = v^a_{mm} - v^a_{nn}  (velocity difference)
   r^{a;b}_{nm} = generalized derivative via Sipe's sum rule
 """
@@ -61,6 +64,7 @@ def compute_delta_Q(system: System, cfg: dict) -> dict:
     nk1, nk2 = calc['nk']
     eflist = np.asarray(calc['eflist'], dtype=float)
     kT = float(calc['kT'])
+    eta = float(calc.get('eta', 0.0))
     nef = len(eflist)
 
     # Parse field direction(s)
@@ -87,7 +91,8 @@ def compute_delta_Q(system: System, cfg: dict) -> dict:
     ) | set(field_dirs))
 
     parallel.print_root(
-        f"  Delta Q: components={ab_pairs}, field_direction={field_dirs}"
+        f"  Delta Q: components={ab_pairs}, field_direction={field_dirs}, "
+        f"eta={eta}"
     )
 
     b1, b2, _b3 = get_reciprocal_lattice(system.unitcell_vectors)
@@ -140,7 +145,7 @@ def compute_delta_Q(system: System, cfg: dict) -> dict:
 
         kpt = _process_kpoint(
             system, tk, dir_chars, ab_pairs, field_dirs,
-            eflist, kT, nef,
+            eflist, kT, nef, eta,
         )
 
         for ab in ab_pairs:
@@ -164,7 +169,7 @@ def compute_delta_Q(system: System, cfg: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 def _process_kpoint(system, k, dir_chars, ab_pairs, field_dirs,
-                    eflist, kT, nef):
+                    eflist, kT, nef, eta):
     """Process a single k-point: diagonalize, build operators, assemble dQ."""
 
     # Diagonalize with 2nd-order derivatives (needed for Sipe sum rule)
@@ -188,19 +193,23 @@ def _process_kpoint(system, k, dir_chars, ab_pairs, field_dirs,
     nondeg = np.abs(de) >= DEG_THR
     de_safe = np.where(nondeg, de, 1.0)
     inv_de = np.where(nondeg, 1.0 / de_safe, 0.0)
-    inv_de2 = inv_de ** 2
+
+    # Broadened denominators for DC perturbation (Eq. 40)
+    # inv_de_p = 1/(w_{nm} + iη),  inv_de_m = 1/(w_{nm} - iη)
+    inv_de_p = np.where(nondeg, 1.0 / (de + 1j * eta), 0.0)
+    inv_de_m = np.where(nondeg, 1.0 / (de - 1j * eta), 0.0)
 
     # Diagonal velocities and Delta_code[d][n,m] = v^d_{nn} - v^d_{mm}
     # Note: PDF's D^a_{mn} = v^a_{mm} - v^a_{nn} = -Delta_code[a][n,m]
     vdiag = {d: np.diag(vmtx[d]).real.copy() for d in dir_chars}
     Delta = {d: vdiag[d][:, None] - vdiag[d][None, :] for d in dir_chars}
 
-    # Position operator (chi convention): rmtx = -i v / w
+    # Position operator: rmtx = r = -i v / w  (bare, geometric quantity)
     rmtx = {}
     for d in dir_chars:
         rmtx[d] = -1j * vmtx[d] * inv_de
 
-    # Generalized derivative (chi convention): dk_rmtx[d1][d2]
+    # Generalized derivative: dk_rmtx[d1][d2] = r^{d1;d2}  (bare)
     dk_rmtx = {}
     for d1 in dir_chars:
         dk_rmtx[d1] = {}
@@ -219,7 +228,7 @@ def _process_kpoint(system, k, dir_chars, ab_pairs, field_dirs,
         for c in field_dirs:
             dQ_band[a][b][c] = _assemble_delta_Q(
                 vmtx, rmtx, dk_rmtx, Delta,
-                inv_de, inv_de2, nondeg, a, b, c,
+                inv_de, inv_de_p, inv_de_m, nondeg, a, b, c,
             )
 
     # Sum over bands with Fermi weight for each ef
@@ -249,50 +258,58 @@ def _process_kpoint(system, k, dir_chars, ab_pairs, field_dirs,
 # ---------------------------------------------------------------------------
 
 def _assemble_delta_Q(vmtx, rmtx, dk_rmtx, Delta,
-                      inv_de, inv_de2, nondeg, a, b, c):
+                      inv_de, inv_de_p, inv_de_m, nondeg, a, b, c):
     r"""Compute dQ^{ab}_n(c) for all bands n simultaneously.
 
     Returns array of shape (dim,) with dQ for each band.
 
-    Convention note: the chi code uses rmtx = -i*v/w and dk_rmtx is its
-    covariant derivative.  The PDF uses r = +i*v/w = -rmtx.  In all three
-    terms below, the signs from the r <-> rmtx conversion cancel in pairs.
-    For Delta, PDF has D^a_{mn} = v^a_{mm} - v^a_{nn} = -Delta_code[a][n,m].
+    Implements Eq. 40 of revised_formula_sheet_eta.pdf.  The broadened
+    denominators inv_de_p = 1/(w+iη) and inv_de_m = 1/(w-iη) enter only
+    the DC perturbation factors; projector-derivative denominators (v/w)
+    use bare inv_de.
+
+    Code conventions: rmtx = r (PDF Eq. 6), dk_rmtx[c][a] = r^{c;a} (PDF),
+    Delta_code[a][n,m] = v^a_{nn} - v^a_{mm} = -D^a_{mn} (PDF Eq. 2).
     """
 
-    # --- Term 1: Sipe (dressed dipole) ---
-    T_sipe = np.sum(
-        nondeg * (dk_rmtx[c][a] * rmtx[b].T
-                  + rmtx[a] * dk_rmtx[c][b].T) * inv_de,
+    # --- Two-band: Sipe (generalized derivative) terms ---
+    # -r^{c;a}_{nm} v^b_{mn} / [(w_{nm}+iη) w_{nm}]       (Trace II)
+    # -v^a_{nm} r^{c;b}_{mn} / [w_{nm} (w_{nm}-iη)]       (Trace III)
+    T_sipe = -np.sum(
+        nondeg * (dk_rmtx[c][a] * vmtx[b].T * inv_de_p * inv_de
+                  + vmtx[a] * dk_rmtx[c][b].T * inv_de * inv_de_m),
         axis=1,
     )
 
-    # --- Term 2: velocity difference ---
-    T_delta = np.sum(
-        nondeg * (rmtx[c] * rmtx[b].T * (-Delta[a])
-                  + rmtx[a] * rmtx[c].T * (-Delta[b])) * inv_de2,
+    # --- Two-band: Delta (velocity-difference) terms ---
+    # -r^c_{nm} D^a_{mn} v^b_{mn} / [(w_{nm}+iη)^2 w_{nm}]    (Trace II)
+    # -v^a_{nm} r^c_{mn} D^b_{mn} / [w_{nm} (w_{nm}-iη)^2]    (Trace III)
+    # PDF D^a_{mn} = -Delta_code[a][n,m]
+    T_delta = -np.sum(
+        nondeg * (rmtx[c] * (-Delta[a]) * vmtx[b].T * inv_de_p**2 * inv_de
+                  + vmtx[a] * rmtx[c].T * (-Delta[b]) * inv_de * inv_de_m**2),
         axis=1,
     )
 
-    # --- Term 3: three-band ---
-    # Vectorized via matrix products.  Diagonal zeros of inv_de
-    # automatically exclude l=n (inv_de2[n,n]=0) and l=m (inv_de[m,m]=0).
+    # --- Three-band terms ---
+    # -r^c_{nl} v^a_{lm} v^b_{mn} / [(w_{nl}+iη) w_{lm} w_{nm}]  (Trace II)
+    # -r^c_{ln} v^a_{nm} v^b_{ml} / [(w_{nl}-iη) w_{nm} w_{lm}]  (Trace III)
+    #
+    # The broadened factor r^c * inv_de_p handles both parts:
+    #   Part A uses (rmtx[c]*inv_de_p)[n,l] directly.
+    #   Part B uses rmtx[c][l,n]*inv_de_m[n,l] = -(rmtx[c]*inv_de_p)[l,n]
+    #   via inv_de_m[n,l] = -inv_de_p[l,n], and the two minus signs cancel
+    #   in the matrix product.
+    # Diagonal zeros of rmtx (rmtx[n,n]=0) exclude l=n; diagonal zeros
+    # of inv_de exclude l=m.
 
-    # Part A: Sum v^c_{nl}/w^2_{nl} * v^a_{lm}/w_{lm} * v^b_{mn}/w_{nm}
-    C2 = vmtx[c] * inv_de2
-    A1 = vmtx[a] * inv_de
-    part_A = np.sum(
-        nondeg * (C2 @ A1) * vmtx[b].T * inv_de,
-        axis=1,
-    )
+    # Part A: Σ_l (rmtx[c]*inv_de_p)[n,l] * (vmtx[a]*inv_de)[l,m]
+    M_A = (rmtx[c] * inv_de_p) @ (vmtx[a] * inv_de)
+    part_A = np.sum(nondeg * M_A * vmtx[b].T * inv_de, axis=1)
 
-    # Part B: Sum v^a_{nm}/w_{nm} * v^c_{ln}/w^2_{nl} * v^b_{ml}/w_{lm}
-    D = vmtx[c] * inv_de2
-    B1 = vmtx[b].T * inv_de
-    part_B = np.sum(
-        nondeg * vmtx[a] * inv_de * (D.T @ B1),
-        axis=1,
-    )
+    # Part B: Σ_l (vmtx[b]*inv_de)[m,l] * (rmtx[c]*inv_de_p)[l,n]  → transposed
+    M_B = ((vmtx[b] * inv_de) @ (rmtx[c] * inv_de_p)).T
+    part_B = np.sum(nondeg * (vmtx[a] * inv_de) * M_B, axis=1)
 
     T_3band = -(part_A + part_B)
 
@@ -307,14 +324,14 @@ def _compute_dk_rmtx(v_a, v_b, vv_ab, Delta_a, Delta_b, inv_de):
     """Compute generalized derivative of position operator via Sipe sum rule.
 
     Borrowed from nonlinear_optical.py.  Computes the covariant derivative
-    of rmtx_chi = -i*v/de in the chi-code convention:
+    r^{a;b}_{nm} of the position operator r^a_{nm} = -i*v^a_{nm}/w_{nm}:
 
       dk_rmtx[n,m] = (i/de[n,m]) * {
           (v_a * Delta_b + v_b * Delta_a) * inv_de - vv_ab
           + Sum_{p!=n,m} (v_a[n,p]*v_b[p,m]/de[p,m] - v_b[n,p]*v_a[p,m]/de[n,p])
       }
 
-    The PDF generalized derivative is r^{a;b}_PDF = -dk_rmtx[a][b].
+    dk_rmtx[a][b] = r^{a;b} in the PDF convention (no sign flip).
     """
     diag_term = (v_a * Delta_b + v_b * Delta_a) * inv_de - vv_ab
     full_sum = v_a @ (v_b * inv_de) - (v_b * inv_de) @ v_a
