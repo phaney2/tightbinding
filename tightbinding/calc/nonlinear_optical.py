@@ -23,8 +23,18 @@ CHI_NAMES = [
     'chi_ei1', 'chi_ei2',
     'chi_eit1', 'chi_eit2', 'chi_eit3',
     'chi_ie1', 'chi_ie2',
-    'chi_e1', 'chi_e2',
-    'chi_i1', 'chi_i2',
+    'chi_e1', 'chi_e2',       # unphysical first-order density matrix terms
+    'chi_i1', 'chi_i2',       # unphysical first-order density matrix terms
+]
+
+# Physical terms that contribute to chi_total.
+# chi_e1, chi_e2, chi_i1, chi_i2 are unphysical artefacts of the
+# interband/intraband decomposition and must NOT be included in the total.
+CHI_PHYSICAL = [
+    'chi_ii',
+    'chi_ee1', 'chi_ee2',
+    'chi_ei1', 'chi_ei2',
+    'chi_ie1', 'chi_ie2',
 ]
 
 # Direction label → index
@@ -162,6 +172,17 @@ def compute_nonlinear_optical(system: System, cfg: dict) -> dict:
             result[name][a][b][c] = parallel.reduce_sum_complex_array(
                 local_result[f'{name}_{abc}']
             )
+
+    # Build chi_total from physical terms only
+    result['chi_total'] = {}
+    for abc in directions:
+        a, b, c = abc
+        result['chi_total'].setdefault(a, {})
+        result['chi_total'][a].setdefault(b, {})
+        total = np.zeros((nef, nomega), dtype=complex)
+        for name in CHI_PHYSICAL:
+            total += result[name][a][b][c]
+        result['chi_total'][a][b][c] = total
 
     return result
 
@@ -328,6 +349,9 @@ def _process_kpoint(
                 kpt['chi_ie2'][abc][efind, eind] = np.trace(rho_ie2 @ va)
 
                 # ---- first-order density matrix contributions ----
+                # NOTE: chi_e1, chi_e2, chi_i1, chi_i2 are unphysical artefacts
+                # of the interband/intraband decomposition. They are computed for
+                # diagnostic purposes but excluded from chi_total.
                 rho1_e = rmtx[dir_c] * f_mtx / (omega2_mtx - de_mtx - 1j * eta_mtx)
                 rho1_i = np.diag(dk_f[dir_c]) / (omega2_val - 1j * eta_val)
 

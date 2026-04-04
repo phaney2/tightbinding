@@ -142,9 +142,14 @@ def build_onsite_18x18_from_params(params: OnsiteParams) -> NDArray:
     H = np.zeros((18, 18), dtype=complex)
 
     # --- Orbital energies ---
+    # Per-orbital overrides: u_pz for pz (index 3), u_dz2 for dz² (index 8),
+    # u_dxz for dyz,dzx (indices 5,6)
+    e_pz = params.u_pz if params.u_pz is not None else params.u_p
+    e_dz2 = params.u_dz2 if params.u_dz2 is not None else params.u_d
+    e_dxz = params.u_dxz if params.u_dxz is not None else params.u_d
     orb_e = np.array([params.u_s,
-                      params.u_p, params.u_p, params.u_p,
-                      params.u_d, params.u_d, params.u_d, params.u_d, params.u_d],
+                      params.u_p, params.u_p, e_pz,
+                      params.u_d, e_dxz, e_dxz, params.u_d, e_dz2],
                      dtype=complex)
     H[0:9, 0:9] += np.diag(orb_e)
     H[9:18, 9:18] += np.diag(orb_e)

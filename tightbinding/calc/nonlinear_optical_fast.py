@@ -292,6 +292,8 @@ def _process_kpoint_fast(
         kpt['chi_ie2'][abc] = s_om2 * np.einsum('nm,enm,nmw->ew', K_ie2, dk_f_mtx_all[dir_c], denom12)
 
         # ---- chi_e1, chi_i1, chi_e2, chi_i2 ----
+        # NOTE: these are unphysical artefacts of the interband/intraband
+        # decomposition. Computed for diagnostics but excluded from chi_total.
         dk_ba = dk_rmtx[dir_b][dir_a]  # (D, D)
         dk_ca = dk_rmtx[dir_c][dir_a]  # (D, D)
 

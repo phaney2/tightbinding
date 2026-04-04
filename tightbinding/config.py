@@ -27,14 +27,16 @@ def _validate(cfg: dict) -> None:
     sys = cfg['system']
     if 'lattice_vectors' not in sys:
         raise ValueError("Missing system.lattice_vectors")
-    if 'basis' not in sys:
-        raise ValueError("Missing system.basis")
 
     # Must have either lattice_type or positions
     if 'lattice_type' not in sys and 'positions' not in sys:
         raise ValueError(
             "system must have either 'lattice_type' or 'positions'"
         )
+
+    # system.basis is required unless per-atom basis is given via positions
+    if 'basis' not in sys and 'positions' not in sys:
+        raise ValueError("Missing system.basis")
 
     if 'type' not in cfg['calc']:
         raise ValueError("Missing calc.type")

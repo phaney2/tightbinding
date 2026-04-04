@@ -34,6 +34,9 @@ class OnsiteParams:
     u_s: float = 0.0
     u_p: float = 0.0
     u_d: float = 0.0
+    u_pz: float | None = None       # pz on-site; defaults to u_p when None
+    u_dz2: float | None = None      # dz² on-site; defaults to u_d when None
+    u_dxz: float | None = None      # dxz,dyz on-site (Δ₁); defaults to u_d when None
     delta_s: float = 0.0
     delta_p: float = 0.0
     delta_d: float = 0.0
@@ -95,6 +98,8 @@ class System:
     onsite_params: dict[str, OnsiteParams] | None = None    # keyed by species
     hopping_params: dict[str, HoppingParams] | None = None  # keyed by species
     orbital_position: dict[str, NDArray] | None = None  # a^(W,a) matrices, keyed by 'x','y','z'
+    hopping_anisotropy_direction: NDArray | None = None  # unit vector ê for strain axis
+    hopping_anisotropy_factor: float = 0.0               # δ in traceless anisotropy
 
 
 @dataclass
