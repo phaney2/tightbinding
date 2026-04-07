@@ -124,14 +124,23 @@ def compute_delta_Q(system: System, cfg: dict) -> dict:
 
     my_indices, my_klist = parallel.scatter_work(k_list)
 
+    # Term names for 5-term decomposition
+    TERM_NAMES = ['T_Sipe_Delta', 'T_Sipe_d2H', 'T_Sipe_3band',
+                  'T_Delta', 'T_3band']
+
     # Local accumulators
     local_dQ = {}
+    local_dQ_terms = {}
     for ab in ab_pairs:
         a, b = ab
         local_dQ.setdefault(a, {})
         local_dQ[a].setdefault(b, {})
+        local_dQ_terms.setdefault(a, {})
+        local_dQ_terms[a].setdefault(b, {})
         for c in field_dirs:
             local_dQ[a][b][c] = np.zeros(nef, dtype=complex)
+            local_dQ_terms[a][b][c] = {t: np.zeros(nef, dtype=complex)
+                                       for t in TERM_NAMES}
 
     warnings.filterwarnings('ignore', category=RuntimeWarning)
 
@@ -143,7 +152,7 @@ def compute_delta_Q(system: System, cfg: dict) -> dict:
                 print(f"  k-point {done}/{total_local} on rank 0 "
                       f"({100 * done / total_local:.0f}%)")
 
-        kpt = _process_kpoint(
+        kpt, kpt_terms = _process_kpoint(
             system, tk, dir_chars, ab_pairs, field_dirs,
             eflist, kT, nef, eta,
         )
@@ -152,16 +161,26 @@ def compute_delta_Q(system: System, cfg: dict) -> dict:
             a, b = ab
             for c in field_dirs:
                 local_dQ[a][b][c] += kpt[a][b][c] * norm
+                for t in TERM_NAMES:
+                    local_dQ_terms[a][b][c][t] += kpt_terms[a][b][c][t] * norm
 
     # Reduce across all ranks
+    delta_Q_terms = {}
     for ab in ab_pairs:
         a, b = ab
+        delta_Q_terms.setdefault(a, {})
+        delta_Q_terms[a].setdefault(b, {})
         for c in field_dirs:
             delta_Q[a][b][c] = parallel.reduce_sum_complex_array(
                 local_dQ[a][b][c]
             )
+            delta_Q_terms[a][b][c] = {}
+            for t in TERM_NAMES:
+                delta_Q_terms[a][b][c][t] = parallel.reduce_sum_complex_array(
+                    local_dQ_terms[a][b][c][t]
+                )
 
-    return {'Q_tilde': {}, 'delta_Q': delta_Q}
+    return {'Q_tilde': {}, 'delta_Q': delta_Q, 'delta_Q_terms': delta_Q_terms}
 
 
 # ---------------------------------------------------------------------------
@@ -210,35 +229,51 @@ def _process_kpoint(system, k, dir_chars, ab_pairs, field_dirs,
         rmtx[d] = -1j * vmtx[d] * inv_de
 
     # Generalized derivative: dk_rmtx[d1][d2] = r^{d1;d2}  (bare)
+    # Also store sub-terms for term decomposition
     dk_rmtx = {}
+    dk_rmtx_terms = {}
     for d1 in dir_chars:
         dk_rmtx[d1] = {}
+        dk_rmtx_terms[d1] = {}
         for d2 in dir_chars:
-            dk_rmtx[d1][d2] = _compute_dk_rmtx(
+            dk_rmtx[d1][d2], dk_rmtx_terms[d1][d2] = _compute_dk_rmtx(
                 vmtx[d1], vmtx[d2], vvmtx[d1 + d2],
                 Delta[d1], Delta[d2], inv_de,
+                return_terms=True,
             )
 
     # Compute dQ^{ab}_n for requested (a,b) pairs and field directions
     dQ_band = {}
+    dQ_band_terms = {}
     for ab in ab_pairs:
         a, b = ab
         dQ_band.setdefault(a, {})
         dQ_band[a].setdefault(b, {})
+        dQ_band_terms.setdefault(a, {})
+        dQ_band_terms[a].setdefault(b, {})
         for c in field_dirs:
-            dQ_band[a][b][c] = _assemble_delta_Q(
-                vmtx, rmtx, dk_rmtx, Delta,
+            dQ_band[a][b][c], dQ_band_terms[a][b][c] = _assemble_delta_Q(
+                vmtx, rmtx, dk_rmtx, dk_rmtx_terms, Delta,
                 inv_de, inv_de_p, inv_de_m, nondeg, a, b, c,
             )
 
+    # Term names for 5-term decomposition
+    TERM_NAMES = ['T_Sipe_Delta', 'T_Sipe_d2H', 'T_Sipe_3band',
+                  'T_Delta', 'T_3band']
+
     # Sum over bands with Fermi weight for each ef
     result = {}
+    result_terms = {}
     for ab in ab_pairs:
         a, b = ab
         result.setdefault(a, {})
         result[a].setdefault(b, {})
+        result_terms.setdefault(a, {})
+        result_terms[a].setdefault(b, {})
         for c in field_dirs:
             result[a][b][c] = np.zeros(nef, dtype=complex)
+            result_terms[a][b][c] = {t: np.zeros(nef, dtype=complex)
+                                     for t in TERM_NAMES}
 
     for efc in range(nef):
         ef = eflist[efc]
@@ -249,19 +284,29 @@ def _process_kpoint(system, k, dir_chars, ab_pairs, field_dirs,
             a, b = ab
             for c in field_dirs:
                 result[a][b][c][efc] = np.sum(f * dQ_band[a][b][c])
+                for t in TERM_NAMES:
+                    result_terms[a][b][c][t][efc] = np.sum(
+                        f * dQ_band_terms[a][b][c][t]
+                    )
 
-    return result
+    return result, result_terms
 
 
 # ---------------------------------------------------------------------------
 # Assembly of delta Q per band (corrected formula, all bands at once)
 # ---------------------------------------------------------------------------
 
-def _assemble_delta_Q(vmtx, rmtx, dk_rmtx, Delta,
+def _assemble_delta_Q(vmtx, rmtx, dk_rmtx, dk_rmtx_terms, Delta,
                       inv_de, inv_de_p, inv_de_m, nondeg, a, b, c):
     r"""Compute dQ^{ab}_n(c) for all bands n simultaneously.
 
-    Returns array of shape (dim,) with dQ for each band.
+    Returns (total, terms_dict) where total is array(dim,) and terms_dict
+    has 5 entries:
+      T_Sipe_Delta  — Delta sub-term of the Sipe generalized derivative
+      T_Sipe_d2H    — second k-derivative of H sub-term of Sipe
+      T_Sipe_3band  — 3-band sub-term of Sipe
+      T_Delta       — explicit velocity-difference terms (Eq. 40)
+      T_3band       — explicit three-band virtual transition terms (Eq. 40)
 
     Implements Eq. 40 of revised_formula_sheet_eta.pdf.  The broadened
     denominators inv_de_p = 1/(w+iη) and inv_de_m = 1/(w-iη) enter only
@@ -275,9 +320,27 @@ def _assemble_delta_Q(vmtx, rmtx, dk_rmtx, Delta,
     # --- Two-band: Sipe (generalized derivative) terms ---
     # -r^{c;a}_{nm} v^b_{mn} / [(w_{nm}+iη) w_{nm}]       (Trace II)
     # -v^a_{nm} r^{c;b}_{mn} / [w_{nm} (w_{nm}-iη)]       (Trace III)
-    T_sipe = -np.sum(
-        nondeg * (dk_rmtx[c][a] * vmtx[b].T * inv_de_p * inv_de
-                  + vmtx[a] * dk_rmtx[c][b].T * inv_de * inv_de_m),
+    #
+    # Split r^{c;a} into its 3 sub-terms: delta, d2H, 3band
+    sipe_ca = dk_rmtx_terms[c][a]  # dict with 'delta', 'd2H', '3band'
+    sipe_cb = dk_rmtx_terms[c][b]
+
+    common_p = vmtx[b].T * inv_de_p * inv_de   # denominator for Trace II
+    common_m = vmtx[a] * inv_de * inv_de_m      # denominator for Trace III (uses .T of dk_rmtx)
+
+    T_Sipe_Delta = -np.sum(
+        nondeg * (sipe_ca['delta'] * common_p
+                  + common_m * sipe_cb['delta'].T),
+        axis=1,
+    )
+    T_Sipe_d2H = -np.sum(
+        nondeg * (sipe_ca['d2H'] * common_p
+                  + common_m * sipe_cb['d2H'].T),
+        axis=1,
+    )
+    T_Sipe_3band = -np.sum(
+        nondeg * (sipe_ca['3band'] * common_p
+                  + common_m * sipe_cb['3band'].T),
         axis=1,
     )
 
@@ -285,7 +348,7 @@ def _assemble_delta_Q(vmtx, rmtx, dk_rmtx, Delta,
     # -r^c_{nm} D^a_{mn} v^b_{mn} / [(w_{nm}+iη)^2 w_{nm}]    (Trace II)
     # -v^a_{nm} r^c_{mn} D^b_{mn} / [w_{nm} (w_{nm}-iη)^2]    (Trace III)
     # PDF D^a_{mn} = -Delta_code[a][n,m]
-    T_delta = -np.sum(
+    T_Delta = -np.sum(
         nondeg * (rmtx[c] * (-Delta[a]) * vmtx[b].T * inv_de_p**2 * inv_de
                   + vmtx[a] * rmtx[c].T * (-Delta[b]) * inv_de * inv_de_m**2),
         axis=1,
@@ -294,14 +357,6 @@ def _assemble_delta_Q(vmtx, rmtx, dk_rmtx, Delta,
     # --- Three-band terms ---
     # -r^c_{nl} v^a_{lm} v^b_{mn} / [(w_{nl}+iη) w_{lm} w_{nm}]  (Trace II)
     # -r^c_{ln} v^a_{nm} v^b_{ml} / [(w_{nl}-iη) w_{nm} w_{lm}]  (Trace III)
-    #
-    # The broadened factor r^c * inv_de_p handles both parts:
-    #   Part A uses (rmtx[c]*inv_de_p)[n,l] directly.
-    #   Part B uses rmtx[c][l,n]*inv_de_m[n,l] = -(rmtx[c]*inv_de_p)[l,n]
-    #   via inv_de_m[n,l] = -inv_de_p[l,n], and the two minus signs cancel
-    #   in the matrix product.
-    # Diagonal zeros of rmtx (rmtx[n,n]=0) exclude l=n; diagonal zeros
-    # of inv_de exclude l=m.
 
     # Part A: Σ_l (rmtx[c]*inv_de_p)[n,l] * (vmtx[a]*inv_de)[l,m]
     M_A = (rmtx[c] * inv_de_p) @ (vmtx[a] * inv_de)
@@ -313,14 +368,25 @@ def _assemble_delta_Q(vmtx, rmtx, dk_rmtx, Delta,
 
     T_3band = -(part_A + part_B)
 
-    return T_sipe + T_delta + T_3band
+    total = T_Sipe_Delta + T_Sipe_d2H + T_Sipe_3band + T_Delta + T_3band
+
+    terms = {
+        'T_Sipe_Delta': T_Sipe_Delta,
+        'T_Sipe_d2H': T_Sipe_d2H,
+        'T_Sipe_3band': T_Sipe_3band,
+        'T_Delta': T_Delta,
+        'T_3band': T_3band,
+    }
+
+    return total, terms
 
 
 # ---------------------------------------------------------------------------
 # Generalized derivative of position operator (Sipe sum rule)
 # ---------------------------------------------------------------------------
 
-def _compute_dk_rmtx(v_a, v_b, vv_ab, Delta_a, Delta_b, inv_de):
+def _compute_dk_rmtx(v_a, v_b, vv_ab, Delta_a, Delta_b, inv_de,
+                     return_terms=False):
     """Compute generalized derivative of position operator via Sipe sum rule.
 
     Borrowed from nonlinear_optical.py.  Computes the covariant derivative
@@ -332,10 +398,29 @@ def _compute_dk_rmtx(v_a, v_b, vv_ab, Delta_a, Delta_b, inv_de):
       }
 
     dk_rmtx[a][b] = r^{a;b} in the PDF convention (no sign flip).
+
+    If return_terms=True, returns (result, terms_dict) where terms_dict has:
+      'delta': the Delta sub-term (velocity-difference diagonal contribution)
+      'd2H':  the second k-derivative of H sub-term
+      '3band': the 3-band sum sub-term
     """
-    diag_term = (v_a * Delta_b + v_b * Delta_a) * inv_de - vv_ab
+    delta_part = (v_a * Delta_b + v_b * Delta_a) * inv_de
+    d2H_part = -vv_ab
     full_sum = v_a @ (v_b * inv_de) - (v_b * inv_de) @ v_a
     p_sum = full_sum - Delta_a * v_b * inv_de
-    result = 1j * inv_de * (diag_term + p_sum)
+
+    result = 1j * inv_de * (delta_part + d2H_part + p_sum)
     result = np.where(np.isfinite(result), result, 0.0)
-    return result
+
+    if not return_terms:
+        return result
+
+    def _clean(x):
+        return np.where(np.isfinite(x), x, 0.0)
+
+    terms = {
+        'delta': _clean(1j * inv_de * delta_part),
+        'd2H':  _clean(1j * inv_de * d2H_part),
+        '3band': _clean(1j * inv_de * p_sum),
+    }
+    return result, terms

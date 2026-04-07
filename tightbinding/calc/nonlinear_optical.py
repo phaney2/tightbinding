@@ -27,6 +27,17 @@ CHI_NAMES = [
     'chi_i1', 'chi_i2',       # unphysical first-order density matrix terms
 ]
 
+# 5-term breakdown of chi_ei1 and chi_ei2
+CHI_EI_TERM_NAMES = [
+    'chi_ei1_sipe_delta', 'chi_ei1_sipe_d2H', 'chi_ei1_sipe_3band',
+    'chi_ei1_dk_f', 'chi_ei1_delta_r',
+    'chi_ei2_sipe_delta', 'chi_ei2_sipe_d2H', 'chi_ei2_sipe_3band',
+    'chi_ei2_dk_f', 'chi_ei2_delta_r',
+]
+
+# All chi names including sub-terms
+CHI_ALL_NAMES = CHI_NAMES + CHI_EI_TERM_NAMES
+
 # Physical terms that contribute to chi_total.
 # chi_e1, chi_e2, chi_i1, chi_i2 are unphysical artefacts of the
 # interband/intraband decomposition and must NOT be included in the total.
@@ -75,7 +86,7 @@ def compute_nonlinear_optical(system: System, cfg: dict) -> dict:
 
     # Initialize output arrays
     result = {}
-    for name in CHI_NAMES:
+    for name in CHI_ALL_NAMES:
         result[name] = {}
         for abc in directions:
             a, b, c = abc
@@ -130,7 +141,7 @@ def compute_nonlinear_optical(system: System, cfg: dict) -> dict:
 
     # Each rank accumulates into local result arrays
     local_result = {}
-    for name in CHI_NAMES:
+    for name in CHI_ALL_NAMES:
         for abc in directions:
             local_result[f'{name}_{abc}'] = np.zeros((nef, nomega), dtype=complex)
 
@@ -161,12 +172,12 @@ def compute_nonlinear_optical(system: System, cfg: dict) -> dict:
                 kpt['chi_e1'][abc] = chi_e_proj[abc]['chi_e1']
                 kpt['chi_e2'][abc] = chi_e_proj[abc]['chi_e2']
 
-        for name in CHI_NAMES:
+        for name in CHI_ALL_NAMES:
             for abc in directions:
                 local_result[f'{name}_{abc}'] += kpt[name][abc] * norm
 
     # Reduce across all ranks
-    for name in CHI_NAMES:
+    for name in CHI_ALL_NAMES:
         for abc in directions:
             a, b, c = abc
             result[name][a][b][c] = parallel.reduce_sum_complex_array(
@@ -367,7 +378,8 @@ def _process_kpoint(
     return kpt
 
 
-def _compute_dk_rmtx(v_a, v_b, vv_ab, Delta_a, Delta_b, de_mtx, inv_de, dim):
+def _compute_dk_rmtx(v_a, v_b, vv_ab, Delta_a, Delta_b, de_mtx, inv_de, dim,
+                     return_terms=False):
     """Compute generalized derivative of position operator.
 
     Vectorized version of the MATLAB triple loop (lines 183-199).
@@ -376,31 +388,38 @@ def _compute_dk_rmtx(v_a, v_b, vv_ab, Delta_a, Delta_b, de_mtx, inv_de, dim):
         (v_a[n,m]*Delta_b[n,m] + v_b[n,m]*Delta_a[n,m]) / de[n,m] - vv_ab[n,m]
         + sum_{p!=n,m} (v_a[n,p]*v_b[p,m]/de[p,m] - v_b[n,p]*v_a[p,m]/de[n,p])
     }
+
+    If return_terms=True, returns (result, terms_dict) where terms_dict has:
+      'delta': the Delta sub-term (velocity-difference diagonal contribution)
+      'd2H':  the second k-derivative of H sub-term
+      '3band': the 3-band sum sub-term
     """
     # Non-sum terms (from n,m diagonal velocities)
-    diag_term = (v_a * Delta_b + v_b * Delta_a) * inv_de - vv_ab
+    delta_part = (v_a * Delta_b + v_b * Delta_a) * inv_de
+    d2H_part = -vv_ab
 
     # Full sum over all p:
-    # Term1_p: v_a[n,p]*v_b[p,m]*inv_de[p,m]  → (v_a @ (v_b * inv_de))[n,m]
-    # Term2_p: v_b[n,p]*v_a[p,m]*inv_de[n,p]  → ((v_b * inv_de) @ v_a)[n,m]
     full_sum = v_a @ (v_b * inv_de) - (v_b * inv_de) @ v_a
-
-    # Subtract p=n and p=m (where inv_de diagonal = 0 kills some terms):
-    # p=n in Term1: diag_va[n]*v_b[n,m]*inv_de[n,m]   (nonzero)
-    # p=n in Term2: diag_vb[n]*v_a[n,m]*inv_de[n,n]=0  (diagonal inv_de=0)
-    # p=m in Term1: v_a[n,m]*diag_vb[m]*inv_de[m,m]=0  (diagonal inv_de=0)
-    # p=m in Term2: v_b[n,m]*diag_va[m]*inv_de[n,m]   (nonzero)
-    # Net subtraction: (diag_va[n] - diag_va[m]) * v_b[n,m] * inv_de[n,m]
-    #                = Delta_a[n,m] * v_b[n,m] * inv_de[n,m]
     p_sum = full_sum - Delta_a * v_b * inv_de
 
     # Combine: dk_rmtx = i/de * (diag_term + p_sum)
-    result = 1j * inv_de * (diag_term + p_sum)
+    result = 1j * inv_de * (delta_part + d2H_part + p_sum)
 
     # Clean up inf/nan from degenerate states
     result = np.where(np.isfinite(result), result, 0.0)
 
-    return result
+    if not return_terms:
+        return result
+
+    def _clean(x):
+        return np.where(np.isfinite(x), x, 0.0)
+
+    terms = {
+        'delta': _clean(1j * inv_de * delta_part),
+        'd2H':  _clean(1j * inv_de * d2H_part),
+        '3band': _clean(1j * inv_de * p_sum),
+    }
+    return result, terms
 
 
 # ---------------------------------------------------------------------------

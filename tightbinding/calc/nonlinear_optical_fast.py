@@ -26,6 +26,7 @@ def _process_kpoint_fast(
     # ================================================================
     if _k_data is not None:
         ek, vmtx, vvmtx, rmtx, dk_rmtx, Delta, de_mtx, inv_de = _k_data
+        dk_rmtx_terms = None  # not available from cached data
     else:
         H, S, vtb = get_H_v(system, k, order=2)
         ek, psi = diagonalize_hk(H, S, eigenvectors=True)
@@ -58,12 +59,15 @@ def _process_kpoint_fast(
 
         from . nonlinear_optical import _compute_dk_rmtx
         dk_rmtx = {}
+        dk_rmtx_terms = {}
         for d1 in dir_chars:
             dk_rmtx[d1] = {}
+            dk_rmtx_terms[d1] = {}
             for d2 in dir_chars:
-                dk_rmtx[d1][d2] = _compute_dk_rmtx(
+                dk_rmtx[d1][d2], dk_rmtx_terms[d1][d2] = _compute_dk_rmtx(
                     vmtx[d1], vmtx[d2], vvmtx[d1+d2],
-                    Delta[d1], Delta[d2], de_mtx, inv_de, dim)
+                    Delta[d1], Delta[d2], de_mtx, inv_de, dim,
+                    return_terms=True)
 
     # ================================================================
     # Phase 2: Vectorized ef/omega computation
@@ -132,10 +136,10 @@ def _process_kpoint_fast(
     # ================================================================
     # Phase 3: Compute all chi terms vectorized
     # ================================================================
-    from .nonlinear_optical import CHI_NAMES
+    from .nonlinear_optical import CHI_ALL_NAMES
 
     kpt = {}
-    for name in CHI_NAMES:
+    for name in CHI_ALL_NAMES:
         kpt[name] = {}
         for abc in directions:
             kpt[name][abc] = np.zeros((nef, nomega), dtype=complex)
@@ -225,57 +229,68 @@ def _process_kpoint_fast(
         Db = Delta[dir_b]  # (D, D)
         Dc = Delta[dir_c]  # (D, D)
 
-        # t1: denom12 * f_mtx * denom1 * dk_rmtx_bc
-        # trace(va @ t1)[e,w] = sum_{n,m} va[n,m] * denom12[m,n,w] * f_mtx[e,m,n] * denom1[m,n,w] * dk_b[m,n]
-        K1 = dk_b * denom2  # (D,D) -- dk_rmtx_cb with denom2 for t2
-        # t1: sum_{n,m} va[n,m] * f_mtx[e,m,n] * dk_b[m,n] * denom12[m,n,w] * denom1[m,n,w]
-        W1_nm = va.T * dk_b  # va[n,m].T = va[m,n]... let me be careful
-        # trace(va @ M) = sum_{n} (va @ M)[n,n] = sum_{n,m} va[n,m] * M[m,n]
-        # So chi = sum_{n,m} va[n,m] * rho[m,n]
-        # For t1: rho[m,n] = denom12[m,n,w] * f_mtx[m,n] * denom1[m,n,w] * dk_b[m,n]
-        # (but f_mtx has ef dim)
-        # Precompute the k-only part: K_t1[m,n] = va[n,m] * dk_b[m,n] (element-wise product with transposed va)
-        K_t1 = va.T * dk_b  # (D, D): K_t1[m,n] = va[n,m] * dk_b[m,n]
-        # chi_t1[e,w] = sum_{m,n} K_t1[m,n] * f_mtx[e,m,n] * denom12[m,n,w] * denom1[m,n,w]
+        # Precompute common denominator products
         d12_d1 = denom12 * denom1  # (D, D, W)
+        d12_d2 = denom12 * denom2[:, :, None]  # (D, D, W)
+        d12_d1sq = denom12 * denom1_sq  # (D, D, W)
+        d12_d2sq = denom12 * denom2_sq[:, :, None]  # (D, D, W)
+
+        # t1: denom12 * f_mtx * denom1 * dk_rmtx_bc  (Sipe derivative, ω₁)
+        K_t1 = va.T * dk_b  # (D, D): K_t1[m,n] = va[n,m] * dk_b[m,n]
         kpt['chi_eit1'][abc] = np.einsum('mn,emn,mnw->ew', K_t1, f_mtx, d12_d1)
 
-        # t2: same but with dk_c and denom2
+        # t2: same but with dk_c and denom2  (Sipe derivative, ω₂)
         K_t2 = va.T * dk_c
-        d12_d2 = denom12 * denom2[:, :, None]  # (D, D, W)
         kpt['chi_eit1'][abc] += np.einsum('mn,emn,mnw->ew', K_t2, f_mtx, d12_d2)
 
-        # t3: denom12 * rmtx_b * dk_f_mtx_c * denom1
-        # rho[m,n] = denom12[m,n,w] * r_b[m,n] * dk_f_mtx_c[e,m,n] * denom1[m,n,w]
+        # t3: denom12 * rmtx_b * dk_f_mtx_c * denom1  (dk_f, ω₁)
         K_t3 = va.T * r_b  # (D, D)
         kpt['chi_eit2'][abc] = np.einsum('mn,emn,mnw->ew', K_t3, dk_f_mtx_all[dir_c], d12_d1)
 
-        # t4: denom12 * rmtx_c * dk_f_mtx_b * denom2
+        # t4: denom12 * rmtx_c * dk_f_mtx_b * denom2  (dk_f, ω₂)
         K_t4 = va.T * r_c
         kpt['chi_eit2'][abc] += np.einsum('mn,emn,mnw->ew', K_t4, dk_f_mtx_all[dir_b], d12_d2)
 
-        # t5: -denom12 * rmtx_b * f_mtx * Delta_c * denom1^2
+        # t5: -denom12 * rmtx_b * f_mtx * Delta_c * denom1^2  (Delta*r, ω₁)
         K_t5 = va.T * r_b * Dc  # (D, D)
-        d12_d1sq = denom12 * denom1_sq  # (D, D, W)
         kpt['chi_eit3'][abc] = -np.einsum('mn,emn,mnw->ew', K_t5, f_mtx, d12_d1sq)
 
-        # t6: -denom12 * rmtx_c * f_mtx * Delta_b * denom2^2
+        # t6: -denom12 * rmtx_c * f_mtx * Delta_b * denom2^2  (Delta*r, ω₂)
         K_t6 = va.T * r_c * Db
-        d12_d2sq = denom12 * denom2_sq[:, :, None]  # (D, D, W)
         kpt['chi_eit3'][abc] -= np.einsum('mn,emn,mnw->ew', K_t6, f_mtx, d12_d2sq)
 
         # Compose ei1 = t1+t3+t5, ei2 = t2+t4+t6
-        # We computed eit1 = t1+t2, eit2 = t3+t4, eit3 = t5+t6. Recompute ei1/ei2 directly.
-        kpt['chi_ei1'][abc] = (
-            np.einsum('mn,emn,mnw->ew', K_t1, f_mtx, d12_d1) +
-            np.einsum('mn,emn,mnw->ew', K_t3, dk_f_mtx_all[dir_c], d12_d1) -
-            np.einsum('mn,emn,mnw->ew', K_t5, f_mtx, d12_d1sq)
-        )
-        kpt['chi_ei2'][abc] = (
-            np.einsum('mn,emn,mnw->ew', K_t2, f_mtx, d12_d2) +
-            np.einsum('mn,emn,mnw->ew', K_t4, dk_f_mtx_all[dir_b], d12_d2) -
-            np.einsum('mn,emn,mnw->ew', K_t6, f_mtx, d12_d2sq)
-        )
+        ei1_sipe = np.einsum('mn,emn,mnw->ew', K_t1, f_mtx, d12_d1)
+        ei1_dk_f = np.einsum('mn,emn,mnw->ew', K_t3, dk_f_mtx_all[dir_c], d12_d1)
+        ei1_delta_r = -np.einsum('mn,emn,mnw->ew', K_t5, f_mtx, d12_d1sq)
+        kpt['chi_ei1'][abc] = ei1_sipe + ei1_dk_f + ei1_delta_r
+
+        ei2_sipe = np.einsum('mn,emn,mnw->ew', K_t2, f_mtx, d12_d2)
+        ei2_dk_f = np.einsum('mn,emn,mnw->ew', K_t4, dk_f_mtx_all[dir_b], d12_d2)
+        ei2_delta_r = -np.einsum('mn,emn,mnw->ew', K_t6, f_mtx, d12_d2sq)
+        kpt['chi_ei2'][abc] = ei2_sipe + ei2_dk_f + ei2_delta_r
+
+        # 5-term breakdown of chi_ei1 and chi_ei2
+        # Split the Sipe derivative (t1/t2) into delta, d2H, 3band sub-terms
+        kpt['chi_ei1_dk_f'][abc] = ei1_dk_f
+        kpt['chi_ei1_delta_r'][abc] = ei1_delta_r
+        kpt['chi_ei2_dk_f'][abc] = ei2_dk_f
+        kpt['chi_ei2_delta_r'][abc] = ei2_delta_r
+
+        if dk_rmtx_terms is not None:
+            sipe_bc = dk_rmtx_terms[dir_b][dir_c]
+            sipe_cb = dk_rmtx_terms[dir_c][dir_b]
+            for sub in ('delta', 'd2H', '3band'):
+                K_sub1 = va.T * sipe_bc[sub]
+                kpt[f'chi_ei1_sipe_{sub}'][abc] = np.einsum(
+                    'mn,emn,mnw->ew', K_sub1, f_mtx, d12_d1)
+                K_sub2 = va.T * sipe_cb[sub]
+                kpt[f'chi_ei2_sipe_{sub}'][abc] = np.einsum(
+                    'mn,emn,mnw->ew', K_sub2, f_mtx, d12_d2)
+        else:
+            # Fallback: full Sipe term without sub-decomposition
+            kpt['chi_ei1_sipe_delta'][abc] = ei1_sipe
+            kpt['chi_ei2_sipe_delta'][abc] = ei2_sipe
 
         # ---- chi_ie1, chi_ie2: intra-inter ----
         # rho_ie1[m,n] = denom12[m,n,w] * dk_f_mtx_b[e,m,n] * r_c[m,n] / (omega1 - i*eta)

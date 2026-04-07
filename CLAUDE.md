@@ -42,11 +42,22 @@ tightbinding/
 ## Running
 ```bash
 # Serial or single-node
-python -m tightbinding examples/input_qm_test.yaml
+python3 -m tightbinding examples/input_qm_test.yaml
 
-# MPI parallel
-mpiexec -np 4 python -m tightbinding input.yaml
+# MPI parallel (use --use-hwthread-cpus on this machine)
+mpiexec --use-hwthread-cpus -np 8 python3 -m tightbinding input.yaml
+
+# Run a standalone script with MPI
+mpiexec --use-hwthread-cpus -np 8 python3 run_MoS2_dQ.py
 ```
+Note: `python` is not available on this system; always use `python3`. The `--use-hwthread-cpus` flag is needed to avoid "not enough slots" errors with mpiexec.
+
+## Implementing Formulas from PDFs
+Common workflow: user provides a PDF with derivations, Claude reads the equations and implements them in the calc engine. Key practices:
+- Read the PDF carefully; identify the target equation number and all variable definitions
+- Map PDF notation to code variables (e.g., ω_{nm} → `de`, r^a_{nm} → `rmtx[a]`, Δ^a_{mn} → `-Delta[a]`)
+- Check sign conventions against existing validated code (e.g., `_compute_dk_rmtx` is validated via chi^(2))
+- After implementation: test at a single k-point first (check real/imaginary parts, TRS), then run BZ-integrated convergence studies at increasing nk
 
 ## Example Configs
 - `examples/input_bands_test.yaml` — band structure

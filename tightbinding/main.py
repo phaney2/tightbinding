@@ -211,6 +211,14 @@ def _save_delta_Q(result, cfg):
                 else:
                     for d3, arr in v2.items():
                         flat[f"{qty_name}.{d1}.{d2}.{d3}"] = arr
+    # Save per-term decomposition if present
+    if 'delta_Q_terms' in result:
+        qty = result['delta_Q_terms']
+        for d1, v1 in qty.items():
+            for d2, v2 in v1.items():
+                for d3, v3 in v2.items():
+                    for tname, arr in v3.items():
+                        flat[f"delta_Q_terms.{d1}.{d2}.{d3}.{tname}"] = arr
     _save_npz(output_file, flat, cfg)
 
 
