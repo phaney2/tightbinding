@@ -65,6 +65,31 @@ def diagonalize_hk(H, S, eigenvectors=False):
         return np.sort(ek)
 
 
+def _prepare_bloch_arrays(system: System) -> None:
+    """Pre-stack hopping matrices and displacements for vectorized Bloch sums.
+
+    Caches the stacked arrays on the system object for reuse across k-points.
+    """
+    if hasattr(system, '_bloch_H_stack'):
+        return
+
+    nmat = len(system.matrices)
+    dim = system.norbs
+
+    H_stack = np.zeros((nmat, dim, dim), dtype=complex)
+    S_stack = np.zeros((nmat, dim, dim), dtype=complex)
+    R_stack = np.zeros((nmat, 3))
+
+    for i, mat in enumerate(system.matrices):
+        H_stack[i] = mat.H
+        S_stack[i] = mat.S
+        R_stack[i] = mat.displacement
+
+    system._bloch_H_stack = H_stack
+    system._bloch_S_stack = S_stack
+    system._bloch_R_stack = R_stack
+
+
 def get_H_k(system: System, k: NDArray) -> tuple[NDArray, NDArray]:
     """Compute H(k) and S(k) via Bloch phase sums.
 
@@ -78,25 +103,24 @@ def get_H_k(system: System, k: NDArray) -> tuple[NDArray, NDArray]:
     H : Hamiltonian at k, shape (norbs, norbs), Hermitian
     S : Overlap at k, shape (norbs, norbs), Hermitian
     """
-    dim = system.norbs
-    H = np.zeros((dim, dim), dtype=complex)
-    S = np.zeros((dim, dim), dtype=complex)
+    _prepare_bloch_arrays(system)
 
     ap = system.atompos
     kx, ky, kz = k
 
-    for mat in system.matrices:
-        R = mat.displacement
-        # Phase matrix: element-wise phase including intra-cell positions
-        phase = np.exp(1j * (
-            kx * (R[0] + ap.x) +
-            ky * (R[1] + ap.y) +
-            kz * (R[2] + ap.z)
-        ))
-        H += mat.H * phase
-        S += mat.S * phase
+    # Atompos phase (independent of R, computed once)
+    phase_ap = np.exp(1j * (kx * ap.x + ky * ap.y + kz * ap.z))
 
-    # Hermitianize
+    # Scalar Bloch phases: exp(i k·R) for each matrix
+    scalar_phase = np.exp(1j * (system._bloch_R_stack @ k))  # (nmat,)
+
+    # Weighted sums: sum_R X_R * exp(ik·R)
+    H_bare = np.einsum('r,rij->ij', scalar_phase, system._bloch_H_stack)
+    S_bare = np.einsum('r,rij->ij', scalar_phase, system._bloch_S_stack)
+
+    # Apply atompos phase and Hermitianize
+    H = phase_ap * H_bare
+    S = phase_ap * S_bare
     H = 0.5 * (H + H.conj().T)
     S = 0.5 * (S + S.conj().T)
 
@@ -121,58 +145,66 @@ def get_H_v(system: System, k: NDArray, order: int = 1
         order=1: {'x', 'y', 'z'}
         order=2: also includes {'xx', 'xy', 'xz', 'yx', 'yy', 'yz', 'zx', 'zy', 'zz'}
     """
-    dim = system.norbs
-    H = np.zeros((dim, dim), dtype=complex)
-    S = np.zeros((dim, dim), dtype=complex)
+    _prepare_bloch_arrays(system)
 
-    labels_1 = ['x', 'y', 'z']
-    v = {l: np.zeros((dim, dim), dtype=complex) for l in labels_1}
-
-    if order >= 2:
-        labels_2 = ['xx', 'xy', 'xz', 'yx', 'yy', 'yz', 'zx', 'zy', 'zz']
-        for l in labels_2:
-            v[l] = np.zeros((dim, dim), dtype=complex)
+    H_stack = system._bloch_H_stack
+    S_stack = system._bloch_S_stack
+    R_stack = system._bloch_R_stack
 
     ap = system.atompos
     kx, ky, kz = k
     ap_arr = [ap.x, ap.y, ap.z]
 
-    for mat in system.matrices:
-        R = mat.displacement
+    # Atompos phase (independent of R, computed once)
+    phase_ap = np.exp(1j * (kx * ap.x + ky * ap.y + kz * ap.z))
 
-        # Total position: R + atompos  for each Cartesian component
-        Rtot = [R[alpha] + ap_arr[alpha] for alpha in range(3)]
+    # Scalar Bloch phases: exp(i k·R) for each matrix
+    scalar_phase = np.exp(1j * (R_stack @ k))  # (nmat,)
 
-        phase = np.exp(1j * (kx * Rtot[0] + ky * Rtot[1] + kz * Rtot[2]))
+    # Weighted H matrices: H_R * exp(ik·R), shape (nmat, dim, dim)
+    weighted_H = H_stack * scalar_phase[:, None, None]
 
-        Hphase = mat.H * phase
-        Sphase = mat.S * phase
+    # H_bare = sum_R H_R * exp(ik·R)
+    H_bare = weighted_H.sum(axis=0)
+    S_bare = (S_stack * scalar_phase[:, None, None]).sum(axis=0)
 
-        H += Hphase
-        S += Sphase
-
-        # First derivatives: v_a = i * R_a * H * phase
-        for alpha, label in enumerate(labels_1):
-            v[label] += 1j * Rtot[alpha] * Hphase
-
-        # Second derivatives: v_ab = (i)^2 * R_a * R_b * H * phase
-        if order >= 2:
-            for a in range(3):
-                for b in range(3):
-                    label = labels_1[a] + labels_1[b]
-                    v[label] += (-1) * Rtot[a] * Rtot[b] * Hphase
+    # Apply atompos phase
+    H = phase_ap * H_bare
+    S = phase_ap * S_bare
 
     # Hermitianize
     H = 0.5 * (H + H.conj().T)
     S = 0.5 * (S + S.conj().T)
 
-    for label in labels_1:
-        v[label] = 0.5 * (v[label] + v[label].conj().T)
+    # --- Velocity operators ---
+    labels_1 = ['x', 'y', 'z']
+    v = {}
 
+    # R-weighted sums: sum_R R_alpha * H_R * exp(ik·R)
+    H_R_weighted = [None, None, None]
+    for alpha in range(3):
+        H_R_weighted[alpha] = (R_stack[:, alpha, None, None] * weighted_H).sum(axis=0)
+
+    # First derivatives: v_a = i * (R_a + ap_a) * H_R * phase
+    #   = i * phase_ap * (H_R_weighted[a] + ap_a * H_bare)
+    for alpha, label in enumerate(labels_1):
+        v_raw = 1j * phase_ap * (H_R_weighted[alpha] + ap_arr[alpha] * H_bare)
+        v[label] = 0.5 * (v_raw + v_raw.conj().T)
+
+    # Second derivatives: v_ab = -(R_a+ap_a)(R_b+ap_b) * H_R * phase
     if order >= 2:
+        # R_a * R_b weighted sums
         for a in range(3):
             for b in range(3):
-                lab = labels_1[a] + labels_1[b]
-                v[lab] = 0.5 * (v[lab] + v[lab].conj().T)
+                label = labels_1[a] + labels_1[b]
+                H_RR = (R_stack[:, a, None, None] * R_stack[:, b, None, None]
+                        * weighted_H).sum(axis=0)
+                v_raw = -phase_ap * (
+                    H_RR
+                    + ap_arr[b] * H_R_weighted[a]
+                    + ap_arr[a] * H_R_weighted[b]
+                    + ap_arr[a] * ap_arr[b] * H_bare
+                )
+                v[label] = 0.5 * (v_raw + v_raw.conj().T)
 
     return H, S, v

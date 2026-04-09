@@ -255,18 +255,21 @@ def _process_kpoint(
 
     # Generalized derivative of position operator: dk_rmtx[d1][d2]
     dk_rmtx = {}
+    dk_rmtx_terms = {}
     for d1 in dir_chars:
         dk_rmtx[d1] = {}
+        dk_rmtx_terms[d1] = {}
         for d2 in dir_chars:
             pair = d1 + d2
-            dk_rmtx[d1][d2] = _compute_dk_rmtx(
+            dk_rmtx[d1][d2], dk_rmtx_terms[d1][d2] = _compute_dk_rmtx(
                 vmtx[d1], vmtx[d2], vvmtx[pair], Delta[d1], Delta[d2],
                 de_mtx, inv_de, dim,
+                return_terms=True,
             )
 
     # Now loop over ef and omega
     kpt = {}
-    for name in CHI_NAMES:
+    for name in CHI_ALL_NAMES:
         kpt[name] = {}
         for abc in directions:
             kpt[name][abc] = np.zeros((nef, nomega), dtype=complex)
@@ -351,6 +354,21 @@ def _process_kpoint(
                 kpt['chi_eit3'][abc][efind, eind] = np.trace(va @ (t5 + t6))
                 kpt['chi_ei1'][abc][efind, eind] = np.trace(va @ (t1 + t3 + t5))
                 kpt['chi_ei2'][abc][efind, eind] = np.trace(va @ (t2 + t4 + t6))
+
+                # Sipe sub-term breakdown: split t1/t2 by dk_rmtx sub-terms
+                sipe_bc = dk_rmtx_terms[dir_b][dir_c]
+                sipe_cb = dk_rmtx_terms[dir_c][dir_b]
+                d12_d1_scalar = denom12 * (f_mtx / (omega1_mtx - de_mtx - 1j * eta_mtx))
+                d12_d2_scalar = denom12 * (f_mtx / (omega2_mtx - de_mtx - 1j * eta_mtx))
+                for sub in ('delta', 'd2H', '3band'):
+                    kpt[f'chi_ei1_sipe_{sub}'][abc][efind, eind] = np.trace(
+                        va @ (d12_d1_scalar * sipe_bc[sub]))
+                    kpt[f'chi_ei2_sipe_{sub}'][abc][efind, eind] = np.trace(
+                        va @ (d12_d2_scalar * sipe_cb[sub]))
+                kpt['chi_ei1_dk_f'][abc][efind, eind] = np.trace(va @ t3)
+                kpt['chi_ei1_delta_r'][abc][efind, eind] = np.trace(va @ t5)
+                kpt['chi_ei2_dk_f'][abc][efind, eind] = np.trace(va @ t4)
+                kpt['chi_ei2_delta_r'][abc][efind, eind] = np.trace(va @ t6)
 
                 # ---- intra-inter (chi_ie1, chi_ie2) ----
                 rho_ie1 = denom12 * (dk_f_mtx[dir_b] * rmtx[dir_c] / (omega1_val - 1j * eta_val))

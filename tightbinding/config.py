@@ -20,23 +20,30 @@ def load_config(path: str) -> dict:
 
 def _validate(cfg: dict) -> None:
     """Check that required sections and keys exist."""
-    for section in ('system', 'hopping', 'calc'):
+    for section in ('system', 'calc'):
         if section not in cfg:
             raise ValueError(f"Missing required config section: '{section}'")
+
+    # hopping section is required unless using Wannier input
+    is_wannier = 'wannier_hr' in cfg.get('system', {})
+    if not is_wannier and 'hopping' not in cfg:
+        raise ValueError("Missing required config section: 'hopping'")
 
     sys = cfg['system']
     if 'lattice_vectors' not in sys:
         raise ValueError("Missing system.lattice_vectors")
 
-    # Must have either lattice_type or positions
-    if 'lattice_type' not in sys and 'positions' not in sys:
-        raise ValueError(
-            "system must have either 'lattice_type' or 'positions'"
-        )
+    # Wannier input bypasses lattice_type/positions/basis requirements
+    if 'wannier_hr' not in sys:
+        # Must have either lattice_type or positions
+        if 'lattice_type' not in sys and 'positions' not in sys:
+            raise ValueError(
+                "system must have either 'lattice_type' or 'positions'"
+            )
 
-    # system.basis is required unless per-atom basis is given via positions
-    if 'basis' not in sys and 'positions' not in sys:
-        raise ValueError("Missing system.basis")
+        # system.basis is required unless per-atom basis is given via positions
+        if 'basis' not in sys and 'positions' not in sys:
+            raise ValueError("Missing system.basis")
 
     if 'type' not in cfg['calc']:
         raise ValueError("Missing calc.type")

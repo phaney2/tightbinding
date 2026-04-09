@@ -13,6 +13,7 @@ from .config import load_config
 from .types import KPath
 from .lattice import build_system
 from .hamiltonian import fill_hamiltonian
+from .wannier import build_system_from_hr
 from . import parallel
 
 
@@ -55,8 +56,15 @@ def main(config_path: str) -> dict:
 
     # Build system on rank 0, broadcast to all ranks
     if parallel.is_root():
-        system = build_system(cfg)
-        fill_hamiltonian(system)
+        if 'wannier_hr' in cfg['system']:
+            system = build_system_from_hr(
+                cfg['system']['wannier_hr'],
+                cfg['system']['lattice_vectors'],
+                centres_path=cfg['system'].get('wannier_centres'),
+            )
+        else:
+            system = build_system(cfg)
+            fill_hamiltonian(system)
     else:
         system = None
     system = parallel.bcast(system)

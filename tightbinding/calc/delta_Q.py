@@ -38,7 +38,7 @@ from ..types import System
 from .. import parallel
 
 
-DEG_THR = 1e-5
+DEG_THR_DEFAULT = 1e-5
 _DIR = {'x': 0, 'y': 1, 'z': 2}
 
 
@@ -65,6 +65,7 @@ def compute_delta_Q(system: System, cfg: dict) -> dict:
     eflist = np.asarray(calc['eflist'], dtype=float)
     kT = float(calc['kT'])
     eta = float(calc.get('eta', 0.0))
+    deg_thr = float(calc.get('deg_thr', DEG_THR_DEFAULT))
     nef = len(eflist)
 
     # Parse field direction(s)
@@ -154,7 +155,7 @@ def compute_delta_Q(system: System, cfg: dict) -> dict:
 
         kpt, kpt_terms = _process_kpoint(
             system, tk, dir_chars, ab_pairs, field_dirs,
-            eflist, kT, nef, eta,
+            eflist, kT, nef, eta, deg_thr,
         )
 
         for ab in ab_pairs:
@@ -188,8 +189,10 @@ def compute_delta_Q(system: System, cfg: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 def _process_kpoint(system, k, dir_chars, ab_pairs, field_dirs,
-                    eflist, kT, nef, eta):
+                    eflist, kT, nef, eta, deg_thr=None):
     """Process a single k-point: diagonalize, build operators, assemble dQ."""
+    if deg_thr is None:
+        deg_thr = DEG_THR_DEFAULT
 
     # Diagonalize with 2nd-order derivatives (needed for Sipe sum rule)
     H, S, vtb = get_H_v(system, k, order=2)
@@ -209,7 +212,7 @@ def _process_kpoint(system, k, dir_chars, ab_pairs, field_dirs,
 
     # Energy differences: de[n,m] = E_n - E_m = w_{nm}
     de = ek[:, None] - ek[None, :]
-    nondeg = np.abs(de) >= DEG_THR
+    nondeg = np.abs(de) >= deg_thr
     de_safe = np.where(nondeg, de, 1.0)
     inv_de = np.where(nondeg, 1.0 / de_safe, 0.0)
 
