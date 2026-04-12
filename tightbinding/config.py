@@ -25,16 +25,18 @@ def _validate(cfg: dict) -> None:
             raise ValueError(f"Missing required config section: '{section}'")
 
     # hopping section is required unless using Wannier input
-    is_wannier = 'wannier_hr' in cfg.get('system', {})
+    is_wannier = 'wannier_hr' in cfg.get('system', {}) or \
+                 'wannier_tb' in cfg.get('system', {})
     if not is_wannier and 'hopping' not in cfg:
         raise ValueError("Missing required config section: 'hopping'")
 
     sys = cfg['system']
-    if 'lattice_vectors' not in sys:
+    # lattice_vectors required unless using wannier_tb (which contains them)
+    if 'lattice_vectors' not in sys and 'wannier_tb' not in sys:
         raise ValueError("Missing system.lattice_vectors")
 
     # Wannier input bypasses lattice_type/positions/basis requirements
-    if 'wannier_hr' not in sys:
+    if 'wannier_hr' not in sys and 'wannier_tb' not in sys:
         # Must have either lattice_type or positions
         if 'lattice_type' not in sys and 'positions' not in sys:
             raise ValueError(
@@ -52,8 +54,9 @@ def _validate(cfg: dict) -> None:
 def _convert_arrays(cfg: dict) -> None:
     """Convert list-of-lists to numpy arrays where appropriate."""
     sys = cfg['system']
-    lv = sys['lattice_vectors']
-    sys['lattice_vectors'] = np.array(lv, dtype=float)
+    if 'lattice_vectors' in sys:
+        lv = sys['lattice_vectors']
+        sys['lattice_vectors'] = np.array(lv, dtype=float)
 
     # Convert position coords to numpy arrays
     if 'positions' in sys:

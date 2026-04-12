@@ -14,6 +14,7 @@ tightbinding/
   hamiltonian.py   — fill_hamiltonian(): populates HoppingMatrix.H via Slater-Koster
   slater_koster.py — SK hopping integrals (sp 4x4 and spd 9x9)
   onsite.py        — on-site energies, exchange, SOC (8-dim sp-spin + 18-dim spd-spin)
+  wannier.py       — Wannier90 _hr.dat / _tb.dat parsers + System builders
   basis.py         — orbital basis projectors: all types project from unified 18-dim full space
   bloch.py         — get_H_k(), get_H_v(): Bloch sums + velocity operators
   parallel.py      — MPI wrapper (mpi4py with serial fallback)
