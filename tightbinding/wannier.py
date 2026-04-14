@@ -345,4 +345,10 @@ def build_system_from_tb(tb_path: str,
     system.wannier_r_matrices = r_matrices_scaled
     system.wannier_r_displacements = displacements
 
+    # Store Wannier centres for position operator corrections (Eq. 20, arXiv:1804.04030)
+    if centres_path is not None:
+        system._wannier_centres = centres
+    else:
+        system._wannier_centres = np.zeros((norbs, 3))
+
     return system

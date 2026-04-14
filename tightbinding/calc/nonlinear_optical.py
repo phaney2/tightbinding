@@ -198,6 +198,83 @@ def compute_nonlinear_optical(system: System, cfg: dict) -> dict:
     return result
 
 
+def _compute_A_W_k(system, k, dir_chars=None):
+    """Fourier-interpolate Wannier position operator and its k-derivative.
+
+    Implements Eq. 20 of Ibañez-Azpiroz et al. (arXiv:1804.04030):
+        A^(W)_{k,nm,a} = Σ_R exp(ik·(R+τ_m-τ_n)) <0n|r̂_a - τ_{m,a}|Rm>
+
+    Returns (A_W, dA_W) where:
+      A_W[d]       = A^(W)_d(k), shape (norbs, norbs)
+      dA_W[d1][d2] = ∂_{d2} A^(W)_{d1}(k), shape (norbs, norbs)
+
+    Returns (None, None) if system has no wannier_r_matrices.
+    """
+    if not hasattr(system, 'wannier_r_matrices'):
+        return None, None
+
+    lattice_vectors = system.unitcell_vectors   # (3, 3), rows = a1, a2, a3
+    r_matrices = system.wannier_r_matrices      # list of [r_x, r_y, r_z] per R
+    displacements = system.wannier_r_displacements  # list of R in lattice coords
+    norbs = system.norbs
+    ap = system.atompos
+    kx, ky, kz = k
+    ap_arr = [ap.x, ap.y, ap.z]
+
+    labels = ['x', 'y', 'z']
+    if dir_chars is None:
+        dir_chars = labels
+
+    # phase_ap[i,j] = exp(ik·(τ_j - τ_i))
+    phase_ap = np.exp(1j * (kx * ap.x + ky * ap.y + kz * ap.z))
+
+    # Find R=0 index
+    r0_idx = None
+    for idx, R_latt in enumerate(displacements):
+        if np.allclose(R_latt, 0):
+            r0_idx = idx
+            break
+
+    # Accumulate bare Bloch sums (without phase_ap)
+    bare_A = {d: np.zeros((norbs, norbs), dtype=complex) for d in labels}
+    bare_dA = {d1: {d2: np.zeros((norbs, norbs), dtype=complex)
+                    for d2 in labels} for d1 in labels}
+
+    for r_idx, R_latt in enumerate(displacements):
+        R_cart = R_latt @ lattice_vectors
+        scalar_phase = np.exp(1j * np.dot(k, R_cart))
+
+        for a_idx, a_label in enumerate(labels):
+            r_a = r_matrices[r_idx][a_idx]
+            # For R=0 diagonal: <0n|r̂_a - τ_{n,a}|0n> = 0 exactly.
+            # Zero the diagonal rather than subtracting centres, to avoid
+            # Berry-phase wrapping artifacts in Wannier90's position matrix.
+            if r_idx == r0_idx:
+                r_a = r_a.copy()
+                np.fill_diagonal(r_a, 0.0)
+
+            weighted = r_a * scalar_phase
+            bare_A[a_label] += weighted
+
+            for b_idx, b_label in enumerate(labels):
+                bare_dA[a_label][b_label] += 1j * R_cart[b_idx] * weighted
+
+    # Apply atompos phase:
+    #   A_W[a] = phase_ap * bare_A[a]
+    #   dA_W[a][b] = phase_ap * (bare_dA[a][b] + i * ap_b * bare_A[a])
+    A_W = {}
+    dA_W = {}
+    for a_label in labels:
+        A_W[a_label] = phase_ap * bare_A[a_label]
+        dA_W[a_label] = {}
+        for b_idx, b_label in enumerate(labels):
+            dA_W[a_label][b_label] = phase_ap * (
+                bare_dA[a_label][b_label] + 1j * ap_arr[b_idx] * bare_A[a_label]
+            )
+
+    return A_W, dA_W
+
+
 def _process_kpoint(
     system, k, dim, dir_chars, directions,
     omega1list, omega2_val, omega2_mtx, eta_val, eta_mtx,
@@ -266,6 +343,61 @@ def _process_kpoint(
                 de_mtx, inv_de, dim,
                 return_terms=True,
             )
+
+    # --- Wannier position operator corrections (arXiv:1804.04030) ---
+    A_W, dA_W = _compute_A_W_k(system, k, dir_chars)
+    if A_W is not None:
+        # Rotate to Hamiltonian gauge: A^(H) = U† A^(W) U
+        A_H = {}
+        for d in dir_chars:
+            A_H[d] = psi.conj().T @ A_W[d] @ psi
+
+        # Off-diagonal part = external Berry connection a_nm
+        a_H = {}
+        for d in dir_chars:
+            a_H[d] = A_H[d].copy()
+            np.fill_diagonal(a_H[d], 0.0)
+
+        # Eq. 22: r_nm += a_nm (off-diagonal only)
+        # Save internal-only r_bar for dk_rmtx correction
+        r_bar = {}
+        for d in dir_chars:
+            r_bar[d] = rmtx[d].copy()
+            rmtx[d] = rmtx[d] + a_H[d]
+
+        # Rotate dA_W to Hamiltonian gauge
+        dA_H = {}
+        for d1 in dir_chars:
+            dA_H[d1] = {}
+            for d2 in dir_chars:
+                dA_H[d1][d2] = psi.conj().T @ dA_W[d1][d2] @ psi
+
+        # Diagonal Berry connection: xi_nn^d = A^(H)_{nn,d}
+        xi_diag = {}
+        for d in dir_chars:
+            xi_diag[d] = np.diag(A_H[d]).real.copy()
+
+        # Eq. 36 corrections to dk_rmtx
+        for d1 in dir_chars:
+            for d2 in dir_chars:
+                # Term 1: ordinary derivative of a_nm rotated to H-gauge
+                corr = dA_H[d1][d2].copy()
+                np.fill_diagonal(corr, 0.0)
+
+                # Term 2: connection terms (covariant derivative)
+                # Σ_p r̄_np^{d2} a_pm^{d1} - a_np^{d1} r̄_pm^{d2}
+                corr += r_bar[d2] @ a_H[d1] - a_H[d1] @ r_bar[d2]
+
+                # Term 3: diagonal Berry connection
+                # i (ξ_nn^{d2} - ξ_mm^{d2}) a_nm^{d1}
+                xi_diff = xi_diag[d2][:, None] - xi_diag[d2][None, :]
+                corr += 1j * xi_diff * a_H[d1]
+
+                # Clean: zero diagonal, remove inf/nan
+                np.fill_diagonal(corr, 0.0)
+                corr = np.where(np.isfinite(corr), corr, 0.0)
+
+                dk_rmtx[d1][d2] = dk_rmtx[d1][d2] + corr
 
     # Now loop over ef and omega
     kpt = {}

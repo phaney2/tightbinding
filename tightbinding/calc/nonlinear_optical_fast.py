@@ -57,7 +57,7 @@ def _process_kpoint_fast(
             Delta[d] = vd[:, None] - vd[None, :]
             rmtx[d] = -1j * vmtx[d] * inv_de
 
-        from . nonlinear_optical import _compute_dk_rmtx
+        from . nonlinear_optical import _compute_dk_rmtx, _compute_A_W_k
         dk_rmtx = {}
         dk_rmtx_terms = {}
         for d1 in dir_chars:
@@ -68,6 +68,46 @@ def _process_kpoint_fast(
                     vmtx[d1], vmtx[d2], vvmtx[d1+d2],
                     Delta[d1], Delta[d2], de_mtx, inv_de, dim,
                     return_terms=True)
+
+        # --- Wannier position operator corrections (arXiv:1804.04030) ---
+        A_W, dA_W = _compute_A_W_k(system, k, dir_chars)
+        if A_W is not None:
+            A_H = {}
+            for d in dir_chars:
+                A_H[d] = psi.conj().T @ A_W[d] @ psi
+
+            a_H = {}
+            for d in dir_chars:
+                a_H[d] = A_H[d].copy()
+                np.fill_diagonal(a_H[d], 0.0)
+
+            # Eq. 22: r_nm += a_nm; save internal-only r_bar
+            r_bar = {}
+            for d in dir_chars:
+                r_bar[d] = rmtx[d].copy()
+                rmtx[d] = rmtx[d] + a_H[d]
+
+            dA_H = {}
+            for d1 in dir_chars:
+                dA_H[d1] = {}
+                for d2 in dir_chars:
+                    dA_H[d1][d2] = psi.conj().T @ dA_W[d1][d2] @ psi
+
+            xi_diag = {}
+            for d in dir_chars:
+                xi_diag[d] = np.diag(A_H[d]).real.copy()
+
+            # Eq. 36 corrections to dk_rmtx
+            for d1 in dir_chars:
+                for d2 in dir_chars:
+                    corr = dA_H[d1][d2].copy()
+                    np.fill_diagonal(corr, 0.0)
+                    corr += r_bar[d2] @ a_H[d1] - a_H[d1] @ r_bar[d2]
+                    xi_diff = xi_diag[d2][:, None] - xi_diag[d2][None, :]
+                    corr += 1j * xi_diff * a_H[d1]
+                    np.fill_diagonal(corr, 0.0)
+                    corr = np.where(np.isfinite(corr), corr, 0.0)
+                    dk_rmtx[d1][d2] = dk_rmtx[d1][d2] + corr
 
     # ================================================================
     # Phase 2: Vectorized ef/omega computation

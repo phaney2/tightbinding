@@ -9,7 +9,7 @@ Auto-detects system dimensionality (1D/2D/3D) and produces:
 
 import numpy as np
 
-from ..bloch import get_H_k, get_reciprocal_lattice, diagonalize_hk
+from ..bloch import get_H_k, get_H_v, get_reciprocal_lattice, diagonalize_hk
 from ..types import System
 from .. import parallel
 
@@ -113,14 +113,54 @@ def compute_all_ek(system: System, cfg: dict) -> dict:
         f"{parallel.size} rank(s)"
     )
 
+    do_berry = bool(calc.get('compute_berry_curvature', False))
+    ef_berry = None
+    if do_berry:
+        eflist = calc.get('eflist', None)
+        if eflist is not None:
+            ef_berry = float(np.asarray(eflist).flat[0])
+        else:
+            raise ValueError("compute_berry_curvature requires eflist")
+        kT_berry = float(calc.get('kT', 0.05))
+        parallel.print_root(f"  Berry curvature: ef={ef_berry}, kT={kT_berry}")
+
     # Scatter k-points across MPI ranks
     my_indices, my_klist = parallel.scatter_work(k_list)
 
     # Each rank diagonalizes its subset
-    local_ek = np.array([diagonalize_hk(*get_H_k(system, tk)) for tk in my_klist])
+    if not do_berry:
+        local_ek = np.array([diagonalize_hk(*get_H_k(system, tk)) for tk in my_klist])
+        local_omega = None
+    else:
+        local_ek = np.zeros((len(my_klist), nbands))
+        local_omega = np.zeros(len(my_klist))
+        for i_k, tk in enumerate(my_klist):
+            H, S, v = get_H_v(system, tk, order=1)
+            ek, psi = diagonalize_hk(H, S, eigenvectors=True)
+            local_ek[i_k] = ek
+            # Velocity matrix elements in eigenbasis
+            vx = psi.conj().T @ v['x'] @ psi
+            vy = psi.conj().T @ v['y'] @ psi
+            # Occupation: Fermi-Dirac
+            fn = 1.0 / (np.exp((ek - ef_berry) / kT_berry) + 1.0)
+            # Berry curvature: Omega_z = -2 sum_{n,m} f_nm Im[vx_nm vy_mn] / (em-en)^2
+            de = ek[None, :] - ek[:, None]  # de[n,m] = em - en
+            mask = np.abs(de) > 1e-10
+            np.fill_diagonal(mask, False)
+            f_nm = fn[:, None] - fn[None, :]  # f_nm[n,m] = fn - fm
+            inv_de2 = np.zeros_like(de)
+            inv_de2[mask] = 1.0 / (de[mask] ** 2)
+            # Im[vx_nm * vy_mn] = Im[vx[n,m] * vy[m,n]]
+            cross = (vx * vy.T).imag  # cross[n,m] = Im(vx[n,m]*vy[m,n])
+            local_omega[i_k] = -2.0 * np.sum(f_nm * cross * inv_de2)
 
     # Gather all eigenvalues
     ek_flat = parallel.gather_array(my_indices, local_ek, total_jobs)
+
+    # Gather Berry curvature if computed
+    berry_flat = None
+    if do_berry and local_omega is not None:
+        berry_flat = parallel.gather_array(my_indices, local_omega, total_jobs)
 
     if ndim == 1:
         ekset = ek_flat.reshape(nk_list[0], nbands)
@@ -172,6 +212,16 @@ def compute_all_ek(system: System, cfg: dict) -> dict:
             cbm = min(bs['min'] for bs in above)
             band_gap = cbm - vbm if cbm > vbm else 0.0
 
+    # Reshape Berry curvature to k-grid
+    berry_grid = None
+    if berry_flat is not None:
+        if ndim == 1:
+            berry_grid = berry_flat.reshape(nk_list[0])
+        elif ndim == 2:
+            berry_grid = berry_flat.reshape(nk_list[0], nk_list[1])
+        elif ndim == 3:
+            berry_grid = berry_flat.reshape(nk_list[0], nk_list[1], nk_list[2])
+
     result = {
         'ndim': ndim,
         'ekset': ekset,
@@ -181,6 +231,9 @@ def compute_all_ek(system: System, cfg: dict) -> dict:
         'band_summary': band_summary,
         'band_gap': band_gap,
     }
+    if berry_grid is not None:
+        result['berry_curvature'] = berry_grid
+        result['k_list'] = np.array(k_list)
 
     if parallel.is_root():
         print_summary(result)

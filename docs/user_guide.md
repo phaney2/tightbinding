@@ -272,12 +272,20 @@ calc:
   nk: [60, 60]            # k-grid resolution (1, 2, or 3 values)
   eflist: [2.0]           # Fermi energy for band gap detection (optional)
   dos_bins: 200           # number of DOS histogram bins (optional, default 200)
+  compute_berry_curvature: true  # compute k-resolved Berry curvature (optional, default false)
+  kT: 0.01               # smearing temperature for occupations (optional, default 0.05)
   outputfile: results/out # saves to results/out.npz
 ```
 
+**Berry curvature:** When `compute_berry_curvature` is enabled, the Berry curvature of the occupied bands is computed at each k-point using the Kubo formula:
+
+Omega_z(k) = -2 sum_{n occ, m unocc} Im[vx_nm * vy_mn] / (em - en)^2
+
+This requires `eflist` to determine band occupations. The result includes `berry_curvature` (array on the k-grid) and `k_list` (Cartesian k-point coordinates). The BZ integral of the Berry curvature gives the Chern number (zero for time-reversal-invariant systems).
+
 **Output:**
 - PNG plot: energy surfaces (2D) or E(k) (1D) + density of states
-- `.npz` file with eigenvalues, DOS, band summary
+- `.npz` file with eigenvalues, DOS, band summary (+ Berry curvature if enabled)
 - Printed summary: band edges, bandwidths, band gap, van Hove singularities
 
 **Reloading saved results:**
