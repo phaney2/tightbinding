@@ -17,9 +17,20 @@ def _process_kpoint_fast(
     eflist, kT, nef, nomega,
     # Pre-built k-only quantities (pass None to build internally)
     _k_data=None,
+    # Souza regularization for 1/w_{nm}; defaults to eta_val when None.
+    eta_sos=None,
 ):
-    """Vectorized _process_kpoint: broadcasts over all ef and omega at once."""
+    """Vectorized _process_kpoint: broadcasts over all ef and omega at once.
+
+    Near-degeneracy handling uses Souza Lorentzian regularization:
+      inv_de = w_{nm} / (w_{nm}^2 + eta_sos^2)
+    bounded at w->0, smooth everywhere.  Ensures that the three Sipe
+    sub-terms of dk_rmtx sum exactly to the total (no NaN cleanup).
+    """
     from ..bloch import get_H_v, diagonalize_hk
+
+    if eta_sos is None:
+        eta_sos = eta_val
 
     # ================================================================
     # Phase 1: k-only setup (same as original)
@@ -32,9 +43,9 @@ def _process_kpoint_fast(
         ek, psi = diagonalize_hk(H, S, eigenvectors=True)
 
         de_mtx = ek[:, None] - ek[None, :]
-        de_cutoff = eta_val
-        with np.errstate(divide='ignore', invalid='ignore'):
-            inv_de = np.where(np.abs(de_mtx) > de_cutoff, 1.0 / de_mtx, 0.0)
+        # Souza-style Lorentzian regularization of the bare 1/w_{nm}
+        nondeg = np.abs(de_mtx) > 1e-12
+        inv_de = np.where(nondeg, de_mtx / (de_mtx ** 2 + eta_sos ** 2), 0.0)
 
         dir_pairs = set()
         for abc in directions:
@@ -97,7 +108,10 @@ def _process_kpoint_fast(
             for d in dir_chars:
                 xi_diag[d] = np.diag(A_H[d]).real.copy()
 
-            # Eq. 36 corrections to dk_rmtx
+            # Eq. 36 corrections to dk_rmtx.  Registered also as a
+            # separate sub-term 'wannier_corr' so the Sipe sub-terms
+            # (delta, d2H, 3band, wannier_corr) sum exactly to
+            # the Wannier-corrected dk_rmtx.
             for d1 in dir_chars:
                 for d2 in dir_chars:
                     corr = dA_H[d1][d2].copy()
@@ -106,8 +120,10 @@ def _process_kpoint_fast(
                     xi_diff = xi_diag[d2][:, None] - xi_diag[d2][None, :]
                     corr += 1j * xi_diff * a_H[d1]
                     np.fill_diagonal(corr, 0.0)
-                    corr = np.where(np.isfinite(corr), corr, 0.0)
                     dk_rmtx[d1][d2] = dk_rmtx[d1][d2] + corr
+                    if dk_rmtx_terms is not None and d1 in dk_rmtx_terms \
+                            and d2 in dk_rmtx_terms[d1]:
+                        dk_rmtx_terms[d1][d2]['wannier_corr'] = corr
 
     # ================================================================
     # Phase 2: Vectorized ef/omega computation
@@ -320,13 +336,17 @@ def _process_kpoint_fast(
         if dk_rmtx_terms is not None:
             sipe_bc = dk_rmtx_terms[dir_b][dir_c]
             sipe_cb = dk_rmtx_terms[dir_c][dir_b]
-            for sub in ('delta', 'd2H', '3band'):
-                K_sub1 = va.T * sipe_bc[sub]
-                kpt[f'chi_ei1_sipe_{sub}'][abc] = np.einsum(
-                    'mn,emn,mnw->ew', K_sub1, f_mtx, d12_d1)
-                K_sub2 = va.T * sipe_cb[sub]
-                kpt[f'chi_ei2_sipe_{sub}'][abc] = np.einsum(
-                    'mn,emn,mnw->ew', K_sub2, f_mtx, d12_d2)
+            # 'wannier_corr' only present when the system carries
+            # wannier position operators (arXiv:1804.04030 corrections).
+            for sub in ('delta', 'd2H', '3band', 'wannier_corr'):
+                if sub in sipe_bc:
+                    K_sub1 = va.T * sipe_bc[sub]
+                    kpt[f'chi_ei1_sipe_{sub}'][abc] = np.einsum(
+                        'mn,emn,mnw->ew', K_sub1, f_mtx, d12_d1)
+                if sub in sipe_cb:
+                    K_sub2 = va.T * sipe_cb[sub]
+                    kpt[f'chi_ei2_sipe_{sub}'][abc] = np.einsum(
+                        'mn,emn,mnw->ew', K_sub2, f_mtx, d12_d2)
         else:
             # Fallback: full Sipe term without sub-decomposition
             kpt['chi_ei1_sipe_delta'][abc] = ei1_sipe

@@ -27,11 +27,16 @@ CHI_NAMES = [
     'chi_i1', 'chi_i2',       # unphysical first-order density matrix terms
 ]
 
-# 5-term breakdown of chi_ei1 and chi_ei2
+# 6-term breakdown of chi_ei1 and chi_ei2.
+# 'wannier_corr' is the Wannier-gauge correction to dk_rmtx
+# (arXiv:1804.04030 Eq. 36), separated out so the 6 sub-terms sum
+# exactly to the direct chi_ei1/chi_ei2 values.
 CHI_EI_TERM_NAMES = [
     'chi_ei1_sipe_delta', 'chi_ei1_sipe_d2H', 'chi_ei1_sipe_3band',
+    'chi_ei1_sipe_wannier_corr',
     'chi_ei1_dk_f', 'chi_ei1_delta_r',
     'chi_ei2_sipe_delta', 'chi_ei2_sipe_d2H', 'chi_ei2_sipe_3band',
+    'chi_ei2_sipe_wannier_corr',
     'chi_ei2_dk_f', 'chi_ei2_delta_r',
 ]
 
@@ -72,6 +77,12 @@ def compute_nonlinear_optical(system: System, cfg: dict) -> dict:
     omega1list = np.asarray(calc['omega1list'], dtype=float)
     omega2_val = float(calc.get('omega2', 0.0))
     eta_val = float(calc['eta'])
+    # Souza-style Lorentzian regularization of the bare 1/w_{nm}:
+    #   inv_de = w_{nm} / (w_{nm}^2 + eta_sos^2)
+    # Replaces the old hard cutoff `de_cutoff = eta`.  Default matches
+    # the prior cutoff scale so existing scripts see similar behaviour
+    # quantitatively while gaining smooth regularization properties.
+    eta_sos = float(calc.get('eta_sos', eta_val))
     eflist = np.asarray(calc['eflist'], dtype=float)
     kT = float(calc['kT'])
     directions = calc['directions']  # e.g. ['xzx', 'zxx']
@@ -133,7 +144,7 @@ def compute_nonlinear_optical(system: System, cfg: dict) -> dict:
 
     method_label = f"method={method}" + (f", lam={lam:.0e}" if method == 'projector' else "")
     parallel.print_root(
-        f"  Nonlinear optical: {total_jobs} k-points on {parallel.size} rank(s) ({method_label})"
+        f"  Nonlinear optical: {total_jobs} k-points on {parallel.size} rank(s) ({method_label}, eta={eta_val}, eta_sos={eta_sos})"
     )
 
     # Scatter k-points across MPI ranks
@@ -159,7 +170,7 @@ def compute_nonlinear_optical(system: System, cfg: dict) -> dict:
         kpt = _process_kpoint_fast(
             system, tk, dim, dir_chars, directions,
             omega1list, omega2_val, omega2_mtx, eta_val, eta_mtx,
-            eflist, kT, nef, nomega,
+            eflist, kT, nef, nomega, eta_sos=eta_sos,
         )
 
         # Projector override for chi_e1/chi_e2
@@ -278,9 +289,16 @@ def _compute_A_W_k(system, k, dir_chars=None):
 def _process_kpoint(
     system, k, dim, dir_chars, directions,
     omega1list, omega2_val, omega2_mtx, eta_val, eta_mtx,
-    eflist, kT, nef, nomega,
+    eflist, kT, nef, nomega, eta_sos=None,
 ):
-    """Process a single k-point: diagonalize, build operators, compute chi contributions."""
+    """Process a single k-point: diagonalize, build operators, compute chi contributions.
+
+    Near-degeneracy handling uses Souza Lorentzian regularization
+      inv_de = w_{nm} / (w_{nm}^2 + eta_sos^2)
+    (bounded at w_{nm}->0).  If eta_sos is None, defaults to eta_val.
+    """
+    if eta_sos is None:
+        eta_sos = eta_val
 
     H, S, vtb = get_H_v(system, k, order=2)
 
@@ -290,12 +308,10 @@ def _process_kpoint(
     # Energy difference matrix
     de_mtx = ek[:, None] - ek[None, :]  # de_mtx[n,m] = e_n - e_m
 
-    # Safe inverse of de_mtx (set near-degenerate pairs to 0).
-    # Cutoff at eta: bands closer than the broadening are effectively degenerate
-    # and their 1/de contributions would be unphysical artifacts.
-    de_cutoff = eta_val
-    with np.errstate(divide='ignore', invalid='ignore'):
-        inv_de = np.where(np.abs(de_mtx) > de_cutoff, 1.0 / de_mtx, 0.0)
+    # Souza-style Lorentzian regularization of the bare 1/w_{nm}.
+    # Mask out exact zeros (n == m self-pairs) only.
+    nondeg = np.abs(de_mtx) > 1e-12
+    inv_de = np.where(nondeg, de_mtx / (de_mtx ** 2 + eta_sos ** 2), 0.0)
 
     # Unique 2-char direction pairs needed
     dir_pairs = set()
@@ -393,11 +409,14 @@ def _process_kpoint(
                 xi_diff = xi_diag[d2][:, None] - xi_diag[d2][None, :]
                 corr += 1j * xi_diff * a_H[d1]
 
-                # Clean: zero diagonal, remove inf/nan
+                # Clean: zero diagonal
                 np.fill_diagonal(corr, 0.0)
-                corr = np.where(np.isfinite(corr), corr, 0.0)
 
                 dk_rmtx[d1][d2] = dk_rmtx[d1][d2] + corr
+                # Register corr as a separate Sipe sub-term so the
+                # 4 sub-terms sum exactly to dk_rmtx.
+                if d1 in dk_rmtx_terms and d2 in dk_rmtx_terms[d1]:
+                    dk_rmtx_terms[d1][d2]['wannier_corr'] = corr
 
     # Now loop over ef and omega
     kpt = {}
@@ -487,16 +506,21 @@ def _process_kpoint(
                 kpt['chi_ei1'][abc][efind, eind] = np.trace(va @ (t1 + t3 + t5))
                 kpt['chi_ei2'][abc][efind, eind] = np.trace(va @ (t2 + t4 + t6))
 
-                # Sipe sub-term breakdown: split t1/t2 by dk_rmtx sub-terms
+                # Sipe sub-term breakdown: split t1/t2 by dk_rmtx sub-terms.
+                # 'wannier_corr' only present when the system carries
+                # wannier_r_matrices (i.e. position operator corrections
+                # from arXiv:1804.04030).
                 sipe_bc = dk_rmtx_terms[dir_b][dir_c]
                 sipe_cb = dk_rmtx_terms[dir_c][dir_b]
                 d12_d1_scalar = denom12 * (f_mtx / (omega1_mtx - de_mtx - 1j * eta_mtx))
                 d12_d2_scalar = denom12 * (f_mtx / (omega2_mtx - de_mtx - 1j * eta_mtx))
-                for sub in ('delta', 'd2H', '3band'):
-                    kpt[f'chi_ei1_sipe_{sub}'][abc][efind, eind] = np.trace(
-                        va @ (d12_d1_scalar * sipe_bc[sub]))
-                    kpt[f'chi_ei2_sipe_{sub}'][abc][efind, eind] = np.trace(
-                        va @ (d12_d2_scalar * sipe_cb[sub]))
+                for sub in ('delta', 'd2H', '3band', 'wannier_corr'):
+                    if sub in sipe_bc:
+                        kpt[f'chi_ei1_sipe_{sub}'][abc][efind, eind] = np.trace(
+                            va @ (d12_d1_scalar * sipe_bc[sub]))
+                    if sub in sipe_cb:
+                        kpt[f'chi_ei2_sipe_{sub}'][abc][efind, eind] = np.trace(
+                            va @ (d12_d2_scalar * sipe_cb[sub]))
                 kpt['chi_ei1_dk_f'][abc][efind, eind] = np.trace(va @ t3)
                 kpt['chi_ei1_delta_r'][abc][efind, eind] = np.trace(va @ t5)
                 kpt['chi_ei2_dk_f'][abc][efind, eind] = np.trace(va @ t4)
@@ -530,16 +554,17 @@ def _process_kpoint(
 
 def _compute_dk_rmtx(v_a, v_b, vv_ab, Delta_a, Delta_b, de_mtx, inv_de, dim,
                      return_terms=False):
-    """Compute generalized derivative of position operator.
-
-    Vectorized version of the MATLAB triple loop (lines 183-199).
+    """Compute generalized derivative of position operator (Sipe sum rule).
 
     dk_rmtx[n,m] = (i/de[n,m]) * {
         (v_a[n,m]*Delta_b[n,m] + v_b[n,m]*Delta_a[n,m]) / de[n,m] - vv_ab[n,m]
         + sum_{p!=n,m} (v_a[n,p]*v_b[p,m]/de[p,m] - v_b[n,p]*v_a[p,m]/de[n,p])
     }
 
-    If return_terms=True, returns (result, terms_dict) where terms_dict has:
+    With Souza-regularized inv_de (bounded at w→0), no NaN/Inf appear
+    and the three sub-terms sum exactly to the total dk_rmtx.
+
+    If return_terms=True, returns (result, terms_dict) with:
       'delta': the Delta sub-term (velocity-difference diagonal contribution)
       'd2H':  the second k-derivative of H sub-term
       '3band': the 3-band sum sub-term
@@ -552,23 +577,17 @@ def _compute_dk_rmtx(v_a, v_b, vv_ab, Delta_a, Delta_b, de_mtx, inv_de, dim,
     full_sum = v_a @ (v_b * inv_de) - (v_b * inv_de) @ v_a
     p_sum = full_sum - Delta_a * v_b * inv_de
 
-    # Combine: dk_rmtx = i/de * (diag_term + p_sum)
-    result = 1j * inv_de * (delta_part + d2H_part + p_sum)
-
-    # Clean up inf/nan from degenerate states
-    result = np.where(np.isfinite(result), result, 0.0)
-
     if not return_terms:
-        return result
+        # Combine: dk_rmtx = i·inv_de·(delta + d2H + p_sum)
+        return 1j * inv_de * (delta_part + d2H_part + p_sum)
 
-    def _clean(x):
-        return np.where(np.isfinite(x), x, 0.0)
-
+    # Return sub-terms as separate arrays so they sum exactly to dk_rmtx.
     terms = {
-        'delta': _clean(1j * inv_de * delta_part),
-        'd2H':  _clean(1j * inv_de * d2H_part),
-        '3band': _clean(1j * inv_de * p_sum),
+        'delta': 1j * inv_de * delta_part,
+        'd2H':   1j * inv_de * d2H_part,
+        '3band': 1j * inv_de * p_sum,
     }
+    result = terms['delta'] + terms['d2H'] + terms['3band']
     return result, terms
 
 

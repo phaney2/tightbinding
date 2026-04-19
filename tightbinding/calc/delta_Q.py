@@ -39,7 +39,11 @@ from .. import parallel
 
 
 DEG_THR_DEFAULT = 1e-5
+ETA_SOS_DEFAULT = 0.05
 _DIR = {'x': 0, 'y': 1, 'z': 2}
+
+# One-time deprecation warning bookkeeping.
+_DEG_THR_WARNED = False
 
 
 # ---------------------------------------------------------------------------
@@ -65,7 +69,23 @@ def compute_delta_Q(system: System, cfg: dict) -> dict:
     eflist = np.asarray(calc['eflist'], dtype=float)
     kT = float(calc['kT'])
     eta = float(calc.get('eta', 0.0))
-    deg_thr = float(calc.get('deg_thr', DEG_THR_DEFAULT))
+
+    # Near-degeneracy handling: Souza-style Lorentzian regularization
+    #   inv_de = w_{nm} / (w_{nm}^2 + eta_sos^2)
+    # replaces the old hard-cutoff deg_thr masking.  Bounded at w_{nm}→0
+    # and smoothly collapses to 0 there.  Preserves sum-of-sub-terms
+    # bookkeeping (no NaN/Inf cancellations).
+    eta_sos = float(calc.get('eta_sos', ETA_SOS_DEFAULT))
+
+    # Backward compat: accept deg_thr but ignore it (warn once).
+    global _DEG_THR_WARNED
+    if 'deg_thr' in calc and not _DEG_THR_WARNED:
+        parallel.print_root(
+            "  [delta_Q] NOTE: 'deg_thr' is deprecated; using Souza "
+            f"regularization with eta_sos={eta_sos} instead."
+        )
+        _DEG_THR_WARNED = True
+    deg_thr = 0.0  # not used anymore
     nef = len(eflist)
 
     # Parse field direction(s)
@@ -93,7 +113,7 @@ def compute_delta_Q(system: System, cfg: dict) -> dict:
 
     parallel.print_root(
         f"  Delta Q: components={ab_pairs}, field_direction={field_dirs}, "
-        f"eta={eta}"
+        f"eta={eta}, eta_sos={eta_sos}"
     )
 
     b1, b2, _b3 = get_reciprocal_lattice(system.unitcell_vectors)
@@ -155,7 +175,7 @@ def compute_delta_Q(system: System, cfg: dict) -> dict:
 
         kpt, kpt_terms = _process_kpoint(
             system, tk, dir_chars, ab_pairs, field_dirs,
-            eflist, kT, nef, eta, deg_thr,
+            eflist, kT, nef, eta, eta_sos=eta_sos,
         )
 
         for ab in ab_pairs:
@@ -189,11 +209,16 @@ def compute_delta_Q(system: System, cfg: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 def _process_kpoint(system, k, dir_chars, ab_pairs, field_dirs,
-                    eflist, kT, nef, eta, deg_thr=None):
-    """Process a single k-point: diagonalize, build operators, assemble dQ."""
-    if deg_thr is None:
-        deg_thr = DEG_THR_DEFAULT
+                    eflist, kT, nef, eta, eta_sos=ETA_SOS_DEFAULT,
+                    deg_thr=None):
+    """Process a single k-point: diagonalize, build operators, assemble dQ.
 
+    Near-degeneracy handling uses Souza Lorentzian regularization:
+      inv_de[n,m] = w_{nm} / (w_{nm}^2 + eta_sos^2)
+    which is bounded at w_{nm} -> 0 and reduces to 1/w_{nm} for
+    |w_{nm}| >> eta_sos.  The `deg_thr` argument is retained for
+    backward compatibility but ignored.
+    """
     # Diagonalize with 2nd-order derivatives (needed for Sipe sum rule)
     H, S, vtb = get_H_v(system, k, order=2)
     ek, psi = diagonalize_hk(H, S, eigenvectors=True)
@@ -212,11 +237,15 @@ def _process_kpoint(system, k, dir_chars, ab_pairs, field_dirs,
 
     # Energy differences: de[n,m] = E_n - E_m = w_{nm}
     de = ek[:, None] - ek[None, :]
-    nondeg = np.abs(de) >= deg_thr
-    de_safe = np.where(nondeg, de, 1.0)
-    inv_de = np.where(nondeg, 1.0 / de_safe, 0.0)
 
-    # Broadened denominators for DC perturbation (Eq. 40)
+    # Souza-style Lorentzian regularization of the bare 1/w_{nm}.
+    # Mask out only exact zeros (n == m self-pairs) — the regularization
+    # keeps all other pairs finite.
+    nondeg = np.abs(de) > 1e-12
+    inv_de = np.where(nondeg, de / (de ** 2 + eta_sos ** 2), 0.0)
+
+    # Broadened DC-perturbation denominators (Eq. 40 η, independent of
+    # the eta_sos regularization of the bare 1/w_{nm}).
     # inv_de_p = 1/(w_{nm} + iη),  inv_de_m = 1/(w_{nm} - iη)
     inv_de_p = np.where(nondeg, 1.0 / (de + 1j * eta), 0.0)
     inv_de_m = np.where(nondeg, 1.0 / (de - 1j * eta), 0.0)
