@@ -135,6 +135,13 @@ def _dispatch(system, cfg, calc_type):
             plot_all_ek(result, save_path=f"{output_file}.png")
         return result
 
+    elif calc_type == 'jdos':
+        from .calc.jdos import compute_jdos
+        result = compute_jdos(system, cfg)
+        if parallel.is_root():
+            _save_jdos(result, cfg)
+        return result
+
     else:
         raise ValueError(f"Unknown calc_type: '{calc_type}'")
 
@@ -258,6 +265,21 @@ def load_delta_Q(path):
             result[qty_name][d1].setdefault(d2, {})
             result[qty_name][d1][d2][d3] = data[key]
     return result, cfg
+
+
+def _save_jdos(result, cfg):
+    """Save JDOS results + config to .npz."""
+    output_file = cfg.get('calc', {}).get('outputfile')
+    flat = {
+        'omega': result['omega'],
+        'jdos': result['jdos'],
+        'ef': np.array(result['ef']),
+        'eta': np.array(result['eta']),
+        'kT': np.array(result['kT']),
+        'nk': np.array(result['nk']),
+        'ndim': np.array(result['ndim']),
+    }
+    _save_npz(output_file, flat, cfg)
 
 
 def _save_all_ek(result, cfg):
