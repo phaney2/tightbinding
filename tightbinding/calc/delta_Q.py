@@ -144,8 +144,12 @@ def compute_delta_Q(system: System, cfg: dict) -> dict:
     )
 
     b1, b2, _b3 = get_reciprocal_lattice(system.unitcell_vectors)
-    db1 = b1 / (nk1 - 1)
-    db2 = b2 / (nk2 - 1) if nk2 > 1 else np.zeros(3)
+    # Periodic (endpoint-free) grid: db = b/nk with kc = 0..nk-1 tiles the BZ
+    # exactly once, so the 1/(nk1*nk2) weight is an unbiased BZ average.
+    # (The old db = b/(nk-1) sampled both zone edges — duplicated boundary
+    # lines gave an O(1/nk) systematic error in all BZ integrals.)
+    db1 = b1 / nk1
+    db2 = b2 / nk2 if nk2 > 1 else np.zeros(3)
 
     # Initialize output: delta_Q[a][b][c] -> array(nef,)
     delta_Q = {}

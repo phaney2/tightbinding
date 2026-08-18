@@ -45,8 +45,9 @@ def compute_quantum_metric(system: System, cfg: dict) -> dict:
     # Reciprocal lattice vectors
     b1, b2, _b3 = get_reciprocal_lattice(system.unitcell_vectors)
 
-    db1 = b1 / (nk1 - 1)
-    db2 = b2 / (nk2 - 1) if nk2 > 1 else np.zeros(3)
+    # Periodic (endpoint-free) grid — see note in delta_Q.py.
+    db1 = b1 / nk1
+    db2 = b2 / nk2 if nk2 > 1 else np.zeros(3)
 
     dim = len(system.matrices[0].H)
 

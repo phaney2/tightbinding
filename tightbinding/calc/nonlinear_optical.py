@@ -109,9 +109,10 @@ def compute_nonlinear_optical(system: System, cfg: dict) -> dict:
     # Reciprocal lattice vectors
     b1, b2, b3 = get_reciprocal_lattice(system.unitcell_vectors)
 
-    db1 = b1 / (nk1 - 1) if nk1 > 1 else np.zeros(3)
-    db2 = b2 / (nk2 - 1) if nk2 > 1 else np.zeros(3)
-    db3 = b3 / (nk3 - 1) if nk3 > 1 else np.zeros(3)
+    # Periodic (endpoint-free) grid — see note in delta_Q.py.
+    db1 = b1 / nk1 if nk1 > 1 else np.zeros(3)
+    db2 = b2 / nk2 if nk2 > 1 else np.zeros(3)
+    db3 = b3 / nk3 if nk3 > 1 else np.zeros(3)
 
     dim = len(system.matrices[0].H)
 
@@ -130,13 +131,13 @@ def compute_nonlinear_optical(system: System, cfg: dict) -> dict:
                           + db1 * kc1 + db2 * kc2 + db3 * kc3)
                     k_list.append(tk)
     else:
-        # 2D grid: original behavior with boundary exclusion
-        for kc1 in range(1, nk1 - 1):
+        # 2D grid: full periodic grid (the old version excluded the
+        # kc1 = 0, nk1-1 rows and kx = ±pi points, biasing BZ averages
+        # by O(1/nk); near-degeneracies are now handled by the Souza
+        # eta_sos regularization, so no exclusions are needed).
+        for kc1 in range(nk1):
             for kc2 in range(nk2):
                 tk = -b1/2 - b2/2 + db1 * kc1 + db2 * kc2
-                kx = tk[0]
-                if abs(kx + np.pi) < 1e-6 or abs(kx - np.pi) < 1e-6:
-                    continue
                 k_list.append(tk)
 
     total_jobs = len(k_list)
