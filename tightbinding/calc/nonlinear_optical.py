@@ -471,33 +471,42 @@ def _process_kpoint(
                 dir_a, dir_b, dir_c = abc
 
                 # ---- intra-intra (chi_ii) ----
-                rho_ii = (1.0 / (omega1_mtx + omega2_mtx - 2j * eta_mtx)) * (
-                    np.diag(d2k_f[dir_b][dir_c]) / (omega2_val - 1j * eta_val) +
-                    np.diag(d2k_f[dir_c][dir_b]) / (omega1_val - 1j * eta_val)
+                # Overall (-i)^2 = -1: each intraband (i d/dk) vertex of the
+                # length-gauge coupling E.(r_e + i d/dk) carries a factor -i
+                # relative to the legacy MATLAB expressions (2026-07 audit).
+                rho_ii = -(1.0 / (omega1_mtx + omega2_mtx + 2j * eta_mtx)) * (
+                    np.diag(d2k_f[dir_b][dir_c]) / (omega2_val + 1j * eta_val) +
+                    np.diag(d2k_f[dir_c][dir_b]) / (omega1_val + 1j * eta_val)
                 )
                 kpt['chi_ii'][abc][efind, eind] = np.trace(vmtx[dir_a] @ rho_ii)
 
                 # ---- inter-inter (chi_ee1, chi_ee2) ----
-                G1 = f_mtx * rmtx[dir_b] / (omega1_mtx - de_mtx - 1j * eta_mtx)
+                G1 = f_mtx * rmtx[dir_b] / (omega1_mtx - de_mtx + 1j * eta_mtx)
                 rho_ee1 = G1 @ rmtx[dir_c] - rmtx[dir_c] @ G1
-                rho_ee1 = rho_ee1 / (omega1_mtx + omega2_mtx - de_mtx - 2j * eta_mtx)
+                rho_ee1 = rho_ee1 / (omega1_mtx + omega2_mtx - de_mtx + 2j * eta_mtx)
 
-                G2 = f_mtx * rmtx[dir_c] / (omega2_mtx - de_mtx - 1j * eta_mtx)
+                G2 = f_mtx * rmtx[dir_c] / (omega2_mtx - de_mtx + 1j * eta_mtx)
                 rho_ee2 = G2 @ rmtx[dir_b] - rmtx[dir_b] @ G2
-                rho_ee2 = rho_ee2 / (omega1_mtx + omega2_mtx - de_mtx - 2j * eta_mtx)
+                rho_ee2 = rho_ee2 / (omega1_mtx + omega2_mtx - de_mtx + 2j * eta_mtx)
 
                 kpt['chi_ee1'][abc][efind, eind] = np.trace(vmtx[dir_a] @ rho_ee1)
                 kpt['chi_ee2'][abc][efind, eind] = np.trace(vmtx[dir_a] @ rho_ee2)
 
                 # ---- inter-intra (chi_ei) ----
-                denom12 = 1.0 / (omega1_mtx + omega2_mtx - de_mtx - 2j * eta_mtx)
+                denom12 = 1.0 / (omega1_mtx + omega2_mtx - de_mtx + 2j * eta_mtx)
 
-                t1 = denom12 * (f_mtx / (omega1_mtx - de_mtx - 1j * eta_mtx) * dk_rmtx[dir_b][dir_c])
-                t2 = denom12 * (f_mtx / (omega2_mtx - de_mtx - 1j * eta_mtx) * dk_rmtx[dir_c][dir_b])
-                t3 = denom12 * (rmtx[dir_b] * (dk_f_mtx[dir_c] / (omega1_mtx - de_mtx - 1j * eta_mtx)))
-                t4 = denom12 * (rmtx[dir_c] * (dk_f_mtx[dir_b] / (omega2_mtx - de_mtx - 1j * eta_mtx)))
-                t5 = -denom12 * (rmtx[dir_b] * f_mtx * Delta[dir_c] / (omega1_mtx - de_mtx - 1j * eta_mtx)**2)
-                t6 = -denom12 * (rmtx[dir_c] * f_mtx * Delta[dir_b] / (omega2_mtx - de_mtx - 1j * eta_mtx)**2)
+                # 2026-07 audit corrections (verified against exact pole-sum
+                # sigma^{abc} and the delta_Q sum rule):
+                #  (a) all chi_ei terms carry the factor -i of the intraband
+                #      vertex i d/dk (dropped in the MATLAB original);
+                #  (b) t5/t6: d/dk_c (1/(w - w_nm)) = +Delta^c/(w - w_nm)^2,
+                #      so the old leading minus sign was wrong.
+                t1 = -1j * denom12 * (f_mtx / (omega1_mtx - de_mtx + 1j * eta_mtx) * dk_rmtx[dir_b][dir_c])
+                t2 = -1j * denom12 * (f_mtx / (omega2_mtx - de_mtx + 1j * eta_mtx) * dk_rmtx[dir_c][dir_b])
+                t3 = -1j * denom12 * (rmtx[dir_b] * (dk_f_mtx[dir_c] / (omega1_mtx - de_mtx + 1j * eta_mtx)))
+                t4 = -1j * denom12 * (rmtx[dir_c] * (dk_f_mtx[dir_b] / (omega2_mtx - de_mtx + 1j * eta_mtx)))
+                t5 = -1j * denom12 * (rmtx[dir_b] * f_mtx * Delta[dir_c] / (omega1_mtx - de_mtx + 1j * eta_mtx)**2)
+                t6 = -1j * denom12 * (rmtx[dir_c] * f_mtx * Delta[dir_b] / (omega2_mtx - de_mtx + 1j * eta_mtx)**2)
 
                 va = vmtx[dir_a]
                 kpt['chi_eit1'][abc][efind, eind] = np.trace(va @ (t1 + t2))
@@ -512,8 +521,8 @@ def _process_kpoint(
                 # from arXiv:1804.04030).
                 sipe_bc = dk_rmtx_terms[dir_b][dir_c]
                 sipe_cb = dk_rmtx_terms[dir_c][dir_b]
-                d12_d1_scalar = denom12 * (f_mtx / (omega1_mtx - de_mtx - 1j * eta_mtx))
-                d12_d2_scalar = denom12 * (f_mtx / (omega2_mtx - de_mtx - 1j * eta_mtx))
+                d12_d1_scalar = -1j * denom12 * (f_mtx / (omega1_mtx - de_mtx + 1j * eta_mtx))
+                d12_d2_scalar = -1j * denom12 * (f_mtx / (omega2_mtx - de_mtx + 1j * eta_mtx))
                 for sub in ('delta', 'd2H', '3band', 'wannier_corr'):
                     if sub in sipe_bc:
                         kpt[f'chi_ei1_sipe_{sub}'][abc][efind, eind] = np.trace(
@@ -527,8 +536,9 @@ def _process_kpoint(
                 kpt['chi_ei2_delta_r'][abc][efind, eind] = np.trace(va @ t6)
 
                 # ---- intra-inter (chi_ie1, chi_ie2) ----
-                rho_ie1 = denom12 * (dk_f_mtx[dir_b] * rmtx[dir_c] / (omega1_val - 1j * eta_val))
-                rho_ie2 = denom12 * (dk_f_mtx[dir_c] * rmtx[dir_b] / (omega2_val - 1j * eta_val))
+                # -i from the intraband first vertex (see audit note above).
+                rho_ie1 = -1j * denom12 * (dk_f_mtx[dir_b] * rmtx[dir_c] / (omega1_val + 1j * eta_val))
+                rho_ie2 = -1j * denom12 * (dk_f_mtx[dir_c] * rmtx[dir_b] / (omega2_val + 1j * eta_val))
 
                 kpt['chi_ie1'][abc][efind, eind] = np.trace(rho_ie1 @ va)
                 kpt['chi_ie2'][abc][efind, eind] = np.trace(rho_ie2 @ va)
@@ -537,14 +547,14 @@ def _process_kpoint(
                 # NOTE: chi_e1, chi_e2, chi_i1, chi_i2 are unphysical artefacts
                 # of the interband/intraband decomposition. They are computed for
                 # diagnostic purposes but excluded from chi_total.
-                rho1_e = rmtx[dir_c] * f_mtx / (omega2_mtx - de_mtx - 1j * eta_mtx)
-                rho1_i = np.diag(dk_f[dir_c]) / (omega2_val - 1j * eta_val)
+                rho1_e = rmtx[dir_c] * f_mtx / (omega2_mtx - de_mtx + 1j * eta_mtx)
+                rho1_i = np.diag(dk_f[dir_c]) / (omega2_val + 1j * eta_val)
 
                 kpt['chi_e1'][abc][efind, eind] = np.trace(rho1_e @ dk_rmtx[dir_b][dir_a])
                 kpt['chi_i1'][abc][efind, eind] = np.trace(rho1_i @ dk_rmtx[dir_b][dir_a])
 
-                rho2_e = rmtx[dir_b] * f_mtx / (omega1_mtx - de_mtx - 1j * eta_mtx)
-                rho2_i = np.diag(dk_f[dir_b]) / (omega1_val - 1j * eta_val)
+                rho2_e = rmtx[dir_b] * f_mtx / (omega1_mtx - de_mtx + 1j * eta_mtx)
+                rho2_i = np.diag(dk_f[dir_b]) / (omega1_val + 1j * eta_val)
 
                 kpt['chi_e2'][abc][efind, eind] = np.trace(rho2_e @ dk_rmtx[dir_c][dir_a])
                 kpt['chi_i2'][abc][efind, eind] = np.trace(rho2_i @ dk_rmtx[dir_c][dir_a])
@@ -771,12 +781,12 @@ def _process_kpoint_projector_chi_e(
 
                 # chi_e1: -Σ_{n≠m} C^{mn}_{a;cb} f_{nm} / (ω₂ - ε_{nm} - iη)
                 C_acb = C_cache[(a, c, b)]
-                denom1 = omega2_val - de_mtx - 1j * eta_val
+                denom1 = omega2_val - de_mtx + 1j * eta_val
                 chi_e[abc]['chi_e1'][efind, eind] = -np.sum(C_acb * f_mtx / denom1)
 
                 # chi_e2: -Σ_{n≠m} C^{mn}_{a;bc} f_{nm} / (ω₁ - ε_{nm} - iη)
                 C_abc = C_cache[(a, b, c)]
-                denom2 = omega1_val - de_mtx - 1j * eta_val
+                denom2 = omega1_val - de_mtx + 1j * eta_val
                 chi_e[abc]['chi_e2'][efind, eind] = -np.sum(C_abc * f_mtx / denom2)
 
     return chi_e

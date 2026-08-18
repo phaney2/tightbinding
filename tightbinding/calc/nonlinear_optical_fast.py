@@ -155,15 +155,15 @@ def _process_kpoint_fast(
     omega12 = omega1list + omega2_val  # (W,)
 
     # denom1[n, m, w] = 1 / (omega1[w] - de[n,m] - i*eta)
-    denom1 = 1.0 / (omega1[None, None, :] - de_mtx[:, :, None] - 1j * eta_val)  # (D, D, W)
+    denom1 = 1.0 / (omega1[None, None, :] - de_mtx[:, :, None] + 1j * eta_val)  # (D, D, W)
     # denom2[n, m, w] = 1 / (omega2 - de[n,m] - i*eta)  — omega2 is scalar
-    denom2 = 1.0 / (omega2_val - de_mtx - 1j * eta_val)  # (D, D)
+    denom2 = 1.0 / (omega2_val - de_mtx + 1j * eta_val)  # (D, D)
     # denom12[n, m, w] = 1 / (omega12[w] - de[n,m] - 2i*eta)
-    denom12 = 1.0 / (omega12[None, None, :] - de_mtx[:, :, None] - 2j * eta_val)  # (D, D, W)
+    denom12 = 1.0 / (omega12[None, None, :] - de_mtx[:, :, None] + 2j * eta_val)  # (D, D, W)
     # scalar omega denoms
-    s_om1 = 1.0 / (omega1 - 1j * eta_val)  # (W,)
-    s_om2 = 1.0 / (omega2_val - 1j * eta_val)  # scalar
-    s_om12 = 1.0 / (omega12 - 2j * eta_val)  # (W,)
+    s_om1 = 1.0 / (omega1 + 1j * eta_val)  # (W,)
+    s_om2 = 1.0 / (omega2_val + 1j * eta_val)  # scalar
+    s_om12 = 1.0 / (omega12 + 2j * eta_val)  # (W,)
 
     # denom1_sq[n, m, w] = 1 / (omega1[w] - de[n,m] - i*eta)^2
     denom1_sq = denom1 ** 2  # (D, D, W)
@@ -213,7 +213,8 @@ def _process_kpoint_fast(
         # term1[e, w] = s_om12[w] * sum_n va[n,n] * (d2k_bc[e,n]*s_om2 + d2k_cb[e,n]*s_om1[w])
         t_bc = np.einsum('n,en->e', va_diag, d2k_bc)  # (E,)
         t_cb = np.einsum('n,en->e', va_diag, d2k_cb)  # (E,)
-        kpt['chi_ii'][abc] = s_om12[None, :] * (t_bc[:, None] * s_om2 + t_cb[:, None] * s_om1[None, :])
+        # (-i)^2 = -1 from the two intraband i d/dk vertices (2026-07 audit).
+        kpt['chi_ii'][abc] = -s_om12[None, :] * (t_bc[:, None] * s_om2 + t_cb[:, None] * s_om1[None, :])
 
         # ---- chi_ee1: inter-inter ----
         # G1[e,n,m,w] = f_mtx[e,n,m] * rmtx_b[n,m] * denom1[n,m,w]
@@ -291,39 +292,45 @@ def _process_kpoint_fast(
         d12_d1sq = denom12 * denom1_sq  # (D, D, W)
         d12_d2sq = denom12 * denom2_sq[:, :, None]  # (D, D, W)
 
-        # t1: denom12 * f_mtx * denom1 * dk_rmtx_bc  (Sipe derivative, ω₁)
+        # 2026-07 audit corrections (see nonlinear_optical._process_kpoint):
+        #  (a) every chi_ei term carries the -i of the intraband vertex
+        #      i d/dk in the length-gauge coupling E.(r_e + i d/dk);
+        #  (b) t5/t6: d/dk_c (1/(w - w_nm)) = +Delta^c/(w - w_nm)^2, so the
+        #      legacy leading minus sign is removed (net -1j prefactor).
+
+        # t1: -i * denom12 * f_mtx * denom1 * dk_rmtx_bc  (Sipe derivative, ω₁)
         K_t1 = va.T * dk_b  # (D, D): K_t1[m,n] = va[n,m] * dk_b[m,n]
-        kpt['chi_eit1'][abc] = np.einsum('mn,emn,mnw->ew', K_t1, f_mtx, d12_d1)
+        kpt['chi_eit1'][abc] = -1j * np.einsum('mn,emn,mnw->ew', K_t1, f_mtx, d12_d1)
 
         # t2: same but with dk_c and denom2  (Sipe derivative, ω₂)
         K_t2 = va.T * dk_c
-        kpt['chi_eit1'][abc] += np.einsum('mn,emn,mnw->ew', K_t2, f_mtx, d12_d2)
+        kpt['chi_eit1'][abc] += -1j * np.einsum('mn,emn,mnw->ew', K_t2, f_mtx, d12_d2)
 
-        # t3: denom12 * rmtx_b * dk_f_mtx_c * denom1  (dk_f, ω₁)
+        # t3: -i * denom12 * rmtx_b * dk_f_mtx_c * denom1  (dk_f, ω₁)
         K_t3 = va.T * r_b  # (D, D)
-        kpt['chi_eit2'][abc] = np.einsum('mn,emn,mnw->ew', K_t3, dk_f_mtx_all[dir_c], d12_d1)
+        kpt['chi_eit2'][abc] = -1j * np.einsum('mn,emn,mnw->ew', K_t3, dk_f_mtx_all[dir_c], d12_d1)
 
-        # t4: denom12 * rmtx_c * dk_f_mtx_b * denom2  (dk_f, ω₂)
+        # t4: -i * denom12 * rmtx_c * dk_f_mtx_b * denom2  (dk_f, ω₂)
         K_t4 = va.T * r_c
-        kpt['chi_eit2'][abc] += np.einsum('mn,emn,mnw->ew', K_t4, dk_f_mtx_all[dir_b], d12_d2)
+        kpt['chi_eit2'][abc] += -1j * np.einsum('mn,emn,mnw->ew', K_t4, dk_f_mtx_all[dir_b], d12_d2)
 
-        # t5: -denom12 * rmtx_b * f_mtx * Delta_c * denom1^2  (Delta*r, ω₁)
+        # t5: -i * denom12 * rmtx_b * f_mtx * Delta_c * denom1^2  (Delta*r, ω₁)
         K_t5 = va.T * r_b * Dc  # (D, D)
-        kpt['chi_eit3'][abc] = -np.einsum('mn,emn,mnw->ew', K_t5, f_mtx, d12_d1sq)
+        kpt['chi_eit3'][abc] = -1j * np.einsum('mn,emn,mnw->ew', K_t5, f_mtx, d12_d1sq)
 
-        # t6: -denom12 * rmtx_c * f_mtx * Delta_b * denom2^2  (Delta*r, ω₂)
+        # t6: -i * denom12 * rmtx_c * f_mtx * Delta_b * denom2^2  (Delta*r, ω₂)
         K_t6 = va.T * r_c * Db
-        kpt['chi_eit3'][abc] -= np.einsum('mn,emn,mnw->ew', K_t6, f_mtx, d12_d2sq)
+        kpt['chi_eit3'][abc] += -1j * np.einsum('mn,emn,mnw->ew', K_t6, f_mtx, d12_d2sq)
 
         # Compose ei1 = t1+t3+t5, ei2 = t2+t4+t6
-        ei1_sipe = np.einsum('mn,emn,mnw->ew', K_t1, f_mtx, d12_d1)
-        ei1_dk_f = np.einsum('mn,emn,mnw->ew', K_t3, dk_f_mtx_all[dir_c], d12_d1)
-        ei1_delta_r = -np.einsum('mn,emn,mnw->ew', K_t5, f_mtx, d12_d1sq)
+        ei1_sipe = -1j * np.einsum('mn,emn,mnw->ew', K_t1, f_mtx, d12_d1)
+        ei1_dk_f = -1j * np.einsum('mn,emn,mnw->ew', K_t3, dk_f_mtx_all[dir_c], d12_d1)
+        ei1_delta_r = -1j * np.einsum('mn,emn,mnw->ew', K_t5, f_mtx, d12_d1sq)
         kpt['chi_ei1'][abc] = ei1_sipe + ei1_dk_f + ei1_delta_r
 
-        ei2_sipe = np.einsum('mn,emn,mnw->ew', K_t2, f_mtx, d12_d2)
-        ei2_dk_f = np.einsum('mn,emn,mnw->ew', K_t4, dk_f_mtx_all[dir_b], d12_d2)
-        ei2_delta_r = -np.einsum('mn,emn,mnw->ew', K_t6, f_mtx, d12_d2sq)
+        ei2_sipe = -1j * np.einsum('mn,emn,mnw->ew', K_t2, f_mtx, d12_d2)
+        ei2_dk_f = -1j * np.einsum('mn,emn,mnw->ew', K_t4, dk_f_mtx_all[dir_b], d12_d2)
+        ei2_delta_r = -1j * np.einsum('mn,emn,mnw->ew', K_t6, f_mtx, d12_d2sq)
         kpt['chi_ei2'][abc] = ei2_sipe + ei2_dk_f + ei2_delta_r
 
         # 5-term breakdown of chi_ei1 and chi_ei2
@@ -341,11 +348,11 @@ def _process_kpoint_fast(
             for sub in ('delta', 'd2H', '3band', 'wannier_corr'):
                 if sub in sipe_bc:
                     K_sub1 = va.T * sipe_bc[sub]
-                    kpt[f'chi_ei1_sipe_{sub}'][abc] = np.einsum(
+                    kpt[f'chi_ei1_sipe_{sub}'][abc] = -1j * np.einsum(
                         'mn,emn,mnw->ew', K_sub1, f_mtx, d12_d1)
                 if sub in sipe_cb:
                     K_sub2 = va.T * sipe_cb[sub]
-                    kpt[f'chi_ei2_sipe_{sub}'][abc] = np.einsum(
+                    kpt[f'chi_ei2_sipe_{sub}'][abc] = -1j * np.einsum(
                         'mn,emn,mnw->ew', K_sub2, f_mtx, d12_d2)
         else:
             # Fallback: full Sipe term without sub-decomposition
@@ -359,12 +366,13 @@ def _process_kpoint_fast(
         # Wait: trace(rho @ va) = sum_n (rho @ va)[n,n] = sum_{n,m} rho[n,m]*va[m,n]
         K_ie1 = va * r_c.T  # va[m,n] * r_c[n,m] -> K_ie1[m,n]. But we want rho indexed [n,m].
         # Let me reindex: chi_ie1[e,w] = sum_{n,m} dk_f_mtx_b[e,n,m] * r_c[n,m] * va[m,n] * denom12[n,m,w] * s_om1[w]
+        # -i from the intraband first vertex (2026-07 audit).
         K_ie1 = r_c * va.T  # (D,D): K_ie1[n,m] = r_c[n,m] * va[m,n]
-        kpt['chi_ie1'][abc] = np.einsum('nm,enm,nmw,w->ew', K_ie1, dk_f_mtx_all[dir_b], denom12, s_om1)
+        kpt['chi_ie1'][abc] = -1j * np.einsum('nm,enm,nmw,w->ew', K_ie1, dk_f_mtx_all[dir_b], denom12, s_om1)
 
         # chi_ie2: uses dk_f_mtx_c, r_b, s_om2 (scalar)
         K_ie2 = r_b * va.T
-        kpt['chi_ie2'][abc] = s_om2 * np.einsum('nm,enm,nmw->ew', K_ie2, dk_f_mtx_all[dir_c], denom12)
+        kpt['chi_ie2'][abc] = -1j * s_om2 * np.einsum('nm,enm,nmw->ew', K_ie2, dk_f_mtx_all[dir_c], denom12)
 
         # ---- chi_e1, chi_i1, chi_e2, chi_i2 ----
         # NOTE: these are unphysical artefacts of the interband/intraband
