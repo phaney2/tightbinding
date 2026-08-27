@@ -56,6 +56,13 @@ def reduce_sum_complex_array(local_array):
     return total
 
 
+def reduce_max(local_value):
+    """Allreduce (MAX) a scalar across all ranks."""
+    if comm is None or size == 1:
+        return local_value
+    return comm.allreduce(local_value, op=MPI.MAX)
+
+
 def gather_array(local_indices, local_array, total_count):
     """Gather indexed rows into a full array on all ranks.
 

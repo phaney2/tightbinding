@@ -6,9 +6,114 @@ shape; einsum replaces trace-of-matmul patterns.
 Notation:
   E = nef, W = nomega, D = dim
   indices: e=ef, w=omega, n,m,p = band
+
+The trailing W axis is an *omega axis*, not necessarily a list of photon
+energies: every phase-3 contraction is linear in the omega-dependent kernels,
+so substituting analytically frequency-integrated kernels for the sampled ones
+turns the same code into the frequency-integrated engine.  See
+`_build_omega_kernels` and `calc/freq_integral.py`.
 """
 
 import numpy as np
+
+
+def _build_omega_kernels(de_mtx, omega1list, omega2_val, eta_val,
+                         freq_integral=None):
+    """Build every omega-dependent factor phase 3 consumes.
+
+    All omega dependence of chi^(2) lives in denominator factors; matrix
+    elements, Fermi factors and vertex prefactors are omega-independent.  This
+    function is the single place those factors are formed, which is what lets
+    the sampled and frequency-integrated modes share the term algebra.
+
+    Parameters
+    ----------
+    freq_integral : FreqIntegralSpec or None
+        None  -> sampled mode, W = len(omega1list), kernels evaluated at each
+                 photon energy (the historical behaviour, unchanged).
+        spec  -> integrated mode, W = spec.nchan, each kernel replaced by its
+                 closed-form integral int dw w^(-p) (...) over
+                 [omega_min, omega_max], plus the endpoint-coefficient
+                 channels.
+
+    Returns
+    -------
+    K : dict of arrays whose trailing axis is W
+        'd1'       (D,D,W)   1/(w - de + i eta)
+        'd12'      (D,D,W)   1/(w + w2 - de + 2i eta)
+        'd12_d1'   (D,D,W)   product of the two above, same band pair
+        'd12_d1sq' (D,D,W)   d12 * d1^2
+        'd12_om1'  (D,D,W)   d12 * 1/(w + i eta)
+        'om1'      (W,)      1/(w + i eta)
+        'om12'     (W,)      1/(w + w2 + 2i eta)
+        'om12_om1' (W,)      product of the two above
+        'const'    (W,)      1 (sampled) / int dw w^(-p) (integrated)
+        'ee1A'     (D,D,D,W) [m,n,p] = d12[m,n] * d1[m,p]
+        'ee1B'     (D,D,D,W) [m,n,p] = d12[m,n] * d1[p,n]
+    denom2 : (D,D)   1/(w2 - de + i eta), omega-independent
+    denom2_sq : (D,D)
+    s_om2 : complex  1/(w2 + i eta), omega-independent
+
+    Notes
+    -----
+    * `denom2`/`s_om2` depend on the fixed omega2 only, so they stay outside
+      the integral and simply multiply the integrated kernels.
+    * The three-band contraction in chi_ee1 pairs poles at *different* band
+      pairs, so its kernel genuinely needs three band indices; it does not
+      factorize once integrated.  The (D,D,D,W) transient is ~19 MB at
+      D = 18, W = 200 and is built once per k-point.
+    """
+    d_shape = de_mtx.shape
+
+    if freq_integral is None:
+        omega1 = np.asarray(omega1list, dtype=float)
+        omega12 = omega1 + omega2_val
+        d1 = 1.0 / (omega1[None, None, :] - de_mtx[:, :, None] + 1j * eta_val)
+        d12 = 1.0 / (omega12[None, None, :] - de_mtx[:, :, None] + 2j * eta_val)
+        om1 = 1.0 / (omega1 + 1j * eta_val)
+        om12 = 1.0 / (omega12 + 2j * eta_val)
+        K = {
+            'd1': d1,
+            'd12': d12,
+            'd12_d1': d12 * d1,
+            'd12_d1sq': d12 * d1 ** 2,
+            'd12_om1': d12 * om1,
+            'om1': om1,
+            'om12': om12,
+            'om12_om1': om12 * om1,
+            'const': np.ones(len(omega1), dtype=complex),
+            # [m,n,p,w] = d12[m,n,w] * d1[m,p,w]
+            'ee1A': d12[:, :, None, :] * d1[:, None, :, :],
+            # [m,n,p,w] = d12[m,n,w] * d1[p,n,w]
+            'ee1B': d12[:, :, None, :] * d1.transpose(1, 0, 2)[None, :, :, :],
+        }
+    else:
+        # Retarded poles: 1/(w - X + i c eta) = 1/(w - z) with z = X - i c eta,
+        # so every z sits in the lower half plane for eta > 0.
+        z1 = de_mtx - 1j * eta_val                        # (D,D)
+        z12 = de_mtx - omega2_val - 2j * eta_val          # (D,D)
+        zo1 = np.array(-1j * eta_val, dtype=complex)      # scalar
+        zo12 = np.array(-omega2_val - 2j * eta_val, dtype=complex)
+        fi = freq_integral
+        z1_b = np.broadcast_to(zo1, d_shape)
+        K = {
+            'd1': fi.kernel([z1], [1]),
+            'd12': fi.kernel([z12], [1]),
+            'd12_d1': fi.kernel([z12, z1], [1, 1]),
+            'd12_d1sq': fi.kernel([z12, z1], [1, 2]),
+            'd12_om1': fi.kernel([z12, z1_b], [1, 1]),
+            'om1': fi.kernel([zo1], [1]),
+            'om12': fi.kernel([zo12], [1]),
+            'om12_om1': fi.kernel([zo12, zo1], [1, 1]),
+            'const': fi.kernel([], []),
+            'ee1A': fi.kernel([z12[:, :, None], z1[:, None, :]], [1, 1]),
+            'ee1B': fi.kernel([z12[:, :, None], z1.T[None, :, :]], [1, 1]),
+        }
+
+    denom2 = 1.0 / (omega2_val - de_mtx + 1j * eta_val)   # (D,D)
+    denom2_sq = denom2 ** 2
+    s_om2 = 1.0 / (omega2_val + 1j * eta_val)             # scalar
+    return K, denom2, denom2_sq, s_om2
 
 
 def _process_kpoint_fast(
@@ -19,6 +124,8 @@ def _process_kpoint_fast(
     _k_data=None,
     # Souza regularization for 1/w_{nm}; defaults to eta_val when None.
     eta_sos=None,
+    # FreqIntegralSpec: switches the omega axis from sampled to integrated.
+    freq_integral=None,
 ):
     """Vectorized _process_kpoint: broadcasts over all ef and omega at once.
 
@@ -26,6 +133,12 @@ def _process_kpoint_fast(
       inv_de = w_{nm} / (w_{nm}^2 + eta_sos^2)
     bounded at w->0, smooth everywhere.  Ensures that the three Sipe
     sub-terms of dk_rmtx sum exactly to the total (no NaN cleanup).
+
+    When `freq_integral` is a FreqIntegralSpec, `omega1list` is ignored and
+    the length-W axis of every returned array indexes that spec's channels
+    (analytic frequency integrals plus lower-endpoint coefficients) instead of
+    photon energies.  Phase 3 is unchanged either way: it is linear in the
+    omega-dependent kernels built by `_build_omega_kernels`.
     """
     from ..bloch import get_H_v, diagonalize_hk
 
@@ -150,25 +263,14 @@ def _process_kpoint_fast(
     # f_mtx[e, n, m] = f[e,n] - f[e,m]
     f_mtx = f_arr[:, :, None] - f_arr[:, None, :]  # (E, D, D)
 
-    # --- Omega denominators for ALL omega values at once ---
-    omega1 = omega1list  # (W,)
-    omega12 = omega1list + omega2_val  # (W,)
-
-    # denom1[n, m, w] = 1 / (omega1[w] - de[n,m] - i*eta)
-    denom1 = 1.0 / (omega1[None, None, :] - de_mtx[:, :, None] + 1j * eta_val)  # (D, D, W)
-    # denom2[n, m, w] = 1 / (omega2 - de[n,m] - i*eta)  — omega2 is scalar
-    denom2 = 1.0 / (omega2_val - de_mtx + 1j * eta_val)  # (D, D)
-    # denom12[n, m, w] = 1 / (omega12[w] - de[n,m] - 2i*eta)
-    denom12 = 1.0 / (omega12[None, None, :] - de_mtx[:, :, None] + 2j * eta_val)  # (D, D, W)
-    # scalar omega denoms
-    s_om1 = 1.0 / (omega1 + 1j * eta_val)  # (W,)
-    s_om2 = 1.0 / (omega2_val + 1j * eta_val)  # scalar
-    s_om12 = 1.0 / (omega12 + 2j * eta_val)  # (W,)
-
-    # denom1_sq[n, m, w] = 1 / (omega1[w] - de[n,m] - i*eta)^2
-    denom1_sq = denom1 ** 2  # (D, D, W)
-    # denom2_sq — omega2 is scalar
-    denom2_sq = denom2 ** 2  # (D, D)
+    # --- Omega-dependent kernels, for the whole omega axis at once ---
+    # Sampled mode: one column per photon energy.  Integrated mode: one column
+    # per freq_integral channel.  Phase 3 never touches omega directly.
+    K, denom2, denom2_sq, s_om2 = _build_omega_kernels(
+        de_mtx, omega1list, omega2_val, eta_val, freq_integral
+    )
+    denom1 = K['d1']    # (D, D, W)
+    denom12 = K['d12']  # (D, D, W)
 
     # --- Per-direction precomputations ---
     # dk_f[e, d, n] = v_nn^d * de_f[e, n]
@@ -214,59 +316,36 @@ def _process_kpoint_fast(
         t_bc = np.einsum('n,en->e', va_diag, d2k_bc)  # (E,)
         t_cb = np.einsum('n,en->e', va_diag, d2k_cb)  # (E,)
         # (-i)^2 = -1 from the two intraband i d/dk vertices (2026-07 audit).
-        kpt['chi_ii'][abc] = -s_om12[None, :] * (t_bc[:, None] * s_om2 + t_cb[:, None] * s_om1[None, :])
+        # s_om2 is omega-independent, so it multiplies the s_om12 kernel;
+        # the s_om12*s_om1 product is a genuine two-pole kernel.
+        kpt['chi_ii'][abc] = -(t_bc[:, None] * (s_om2 * K['om12'])[None, :]
+                               + t_cb[:, None] * K['om12_om1'][None, :])
 
         # ---- chi_ee1: inter-inter ----
         # G1[e,n,m,w] = f_mtx[e,n,m] * rmtx_b[n,m] * denom1[n,m,w]
+        # rho_ee1 = (G1 @ r_c - r_c @ G1) * denom12, traced against v_a:
+        #   chi_ee1[e,w] = sum_{n,m,p} va[n,m] * denom12[m,n,w] * (
+        #       Fr_b[e,m,p] * r_c[p,n] * denom1[m,p,w]      <- term A
+        #     - r_c[m,p] * Fr_b[e,p,n] * denom1[p,n,w] )    <- term B
         Fr_b = f_mtx * rmtx[dir_b][None, :, :]  # (E, D, D)
-        # G1 @ r_c: sum_p G1[e,n,p,w] * r_c[p,m] = sum_p Fr_b[e,n,p] * denom1[n,p,w] * r_c[p,m]
-        # rho_ee1[e,n,m,w] = (sum_p Fr_b[e,n,p]*r_c[p,m]*denom1[n,p,w] - r_c[n,p]*Fr_b[e,p,m]*denom1[p,m,w]) * denom12[n,m,w]
-        # chi_ee1[e,w] = sum_{n,m} va[n,m] * rho_ee1[e,m,n,w]
         r_c = rmtx[dir_c]  # (D, D)
         r_b = rmtx[dir_b]  # (D, D)
-        # Use einsum: Fr_b[e,n,p] * denom1[n,p,w] * r_c[p,m] summed over p -> (E, D, D, W)
-        # Then subtract the swapped term, multiply by denom12, trace with va
-        # To keep memory manageable, compute trace directly:
-        # chi_ee1[e,w] = sum_{n,m,p} va[n,m] * denom12[m,n,w] * (
-        #     Fr_b[e,m,p] * r_c[p,n] * denom1[m,p,w]
-        #   - r_c[m,p] * Fr_b[e,p,n] * denom1[p,n,w] )
-        # Term A: sum_{n,m,p} va[n,m] * denom12[m,n,w] * Fr_b[e,m,p] * r_c[p,n] * denom1[m,p,w]
-        # Term B: sum_{n,m,p} va[n,m] * denom12[m,n,w] * r_c[m,p] * Fr_b[e,p,n] * denom1[p,n,w]
 
-        # For dim=9, we can afford to build (D,D,W) intermediates and contract with (E,D,D)
-        # Term A: group (m,p) first
-        #   A_mp[m,p,w] = sum_n va[n,m] * denom12[m,n,w] * r_c[p,n] = sum_n (va * r_c^T)[n,m,p???]
-        # Actually, let's do it more simply. For D=9, the full 4-index tensor is tiny.
-
-        # Build va_d12[n,m,w] = va[n,m] * denom12[m,n,w]  -- note index swap in denom12
-        va_d12 = va[:, :, None] * denom12.transpose(1, 0, 2)  # va[n,m] * denom12[m,n,w] -> (D,D,W)
-
-        # Term A: sum_{n,m,p} va_d12[n,m,w] * Fr_b[e,m,p] * r_c[p,n] * denom1[m,p,w]
-        # = sum_{m,p} (sum_n va_d12[n,m,w] * r_c[p,n]) * Fr_b[e,m,p] * denom1[m,p,w]
-        # Let Q_A[p,m,w] = sum_n va_d12[n,m,w] * r_c[p,n] = sum_n r_c[p,n] * va[n,m] * denom12[m,n,w]
-        Q_A = np.einsum('pn,nmw->pmw', r_c, va_d12)  # (D, D, W)
-        # chi_A[e,w] = sum_{m,p} Q_A[p,m,w] * Fr_b[e,m,p] * denom1[m,p,w]
-        QA_d1 = Q_A * denom1.transpose(1, 0, 2)  # Q_A[p,m,w] * denom1[m,p,w] -- need denom1 as [p,m,w]
-        # Wait, denom1[n,m,w] = 1/(om1[w] - de[n,m] - i*eta). We need denom1[m,p,w].
-        # denom1 is already indexed as [first_band, second_band, w].
-        # Q_A[p,m,w] needs denom1[m,p,w]
-        QA_d1 = Q_A * denom1  # Q_A is (D_p, D_m, W), denom1 is (D_m?, D_p?, W)...
-
-        # Let me be more careful with indices. denom1[i,j,w] = 1/(om1[w] - de[i,j]).
-        # We need denom1 with first index=m, second=p: denom1[m,p,w]. That's just denom1[m,p,w] as-is.
-        # But Q_A has shape (p, m, w). So we need denom1 transposed to (p, m, w) form? No.
-        # Q_A[p,m,w] * denom1[m,p,w]: we need to match indices.
-        # Use einsum for clarity:
-        chi_A = np.einsum('pmw,emp,mpw->ew', Q_A, Fr_b, denom1)  # (E, W)
-
-        # Term B: sum_{n,m,p} va_d12[n,m,w] * r_c[m,p] * Fr_b[e,p,n] * denom1[p,n,w]
-        # = sum_{m,p} r_c[m,p] * (sum_n va_d12[n,m,w] * Fr_b[e,p,n] * denom1[p,n,w])
-        # Let's compute: sum_n va_d12[n,m,w] * denom1[p,n,w] * Fr_b[e,p,n]
-        # = sum_n va[n,m]*denom12[m,n,w] * denom1[p,n,w] * Fr_b[e,p,n]
-        # Q_B[e,m,p,w] = sum_n va_d12[n,m,w] * denom1[p,n,w] * Fr_b[e,p,n]
-        chi_B = np.einsum('nmw,pnw,epn,mp->ew', va_d12, denom1, Fr_b, r_c)
+        # This is the one term whose two omega-dependent factors sit at
+        # *different* band pairs -- denom12 at (m,n), denom1 at (m,p) or (p,n).
+        # The product therefore cannot be folded into a two-index kernel, and
+        # once integrated it does not factorize at all, so both modes go
+        # through the same (D,D,D,W) kernels.  D^3 W is small.
+        chi_A = np.einsum('nm,pn,emp,mnpw->ew',
+                          va, r_c, Fr_b, K['ee1A'], optimize=True)
+        chi_B = np.einsum('nm,mp,epn,mnpw->ew',
+                          va, r_c, Fr_b, K['ee1B'], optimize=True)
 
         kpt['chi_ee1'][abc] = chi_A - chi_B
+
+        # va_d12[n,m,w] = va[n,m] * denom12[m,n,w]  -- note the index swap.
+        # Used by chi_ee2, whose second omega factor (denom2) is a constant.
+        va_d12 = va[:, :, None] * denom12.transpose(1, 0, 2)  # (D,D,W)
 
         # ---- chi_ee2: same structure, swap b<->c and use denom2 (omega2-dependent) ----
         Fr_c = f_mtx * rmtx[dir_c][None, :, :]  # (E, D, D)
@@ -286,10 +365,13 @@ def _process_kpoint_fast(
         Db = Delta[dir_b]  # (D, D)
         Dc = Delta[dir_c]  # (D, D)
 
-        # Precompute common denominator products
-        d12_d1 = denom12 * denom1  # (D, D, W)
+        # Common denominator products.  The *_d1 pair multiplies two
+        # omega-dependent factors and so comes from a two-pole kernel; the
+        # *_d2 pair only rescales the d12 kernel by the omega-independent
+        # denom2, which passes straight through the frequency integral.
+        d12_d1 = K['d12_d1']  # (D, D, W)
+        d12_d1sq = K['d12_d1sq']  # (D, D, W)
         d12_d2 = denom12 * denom2[:, :, None]  # (D, D, W)
-        d12_d1sq = denom12 * denom1_sq  # (D, D, W)
         d12_d2sq = denom12 * denom2_sq[:, :, None]  # (D, D, W)
 
         # 2026-07 audit corrections (see nonlinear_optical._process_kpoint):
@@ -368,7 +450,9 @@ def _process_kpoint_fast(
         # Let me reindex: chi_ie1[e,w] = sum_{n,m} dk_f_mtx_b[e,n,m] * r_c[n,m] * va[m,n] * denom12[n,m,w] * s_om1[w]
         # -i from the intraband first vertex (2026-07 audit).
         K_ie1 = r_c * va.T  # (D,D): K_ie1[n,m] = r_c[n,m] * va[m,n]
-        kpt['chi_ie1'][abc] = -1j * np.einsum('nm,enm,nmw,w->ew', K_ie1, dk_f_mtx_all[dir_b], denom12, s_om1)
+        # denom12 * s_om1: two omega-dependent factors -> two-pole kernel.
+        kpt['chi_ie1'][abc] = -1j * np.einsum(
+            'nm,enm,nmw->ew', K_ie1, dk_f_mtx_all[dir_b], K['d12_om1'])
 
         # chi_ie2: uses dk_f_mtx_c, r_b, s_om2 (scalar)
         K_ie2 = r_b * va.T
@@ -383,13 +467,19 @@ def _process_kpoint_fast(
         # chi_e1 = trace(rho1_e @ dk_ba) where rho1_e = r_c * f_mtx / (omega2 - de - i*eta)
         # = sum_{n,m} (r_c * f_mtx * denom2)[e,n,m] * dk_ba[m,n]  -- no omega dep (omega2 scalar)!
         # = sum_{n,m} r_c[n,m] * f_mtx[e,n,m] * denom2[n,m] * dk_ba[m,n]
+        # chi_e1 and chi_i1 have NO omega dependence at all, so their kernel is
+        # the bare weight int dw w^(-p).  That has no b -> inf limit for p <= 1,
+        # and K['const'] is NaN there; both terms are unphysical and excluded
+        # from chi_total, so nothing downstream is contaminated.
         K_e1 = r_c * denom2 * dk_ba.T  # (D, D)
-        kpt['chi_e1'][abc] = np.einsum('nm,enm->e', K_e1, f_mtx)[:, None].repeat(nomega, axis=1)
+        kpt['chi_e1'][abc] = (np.einsum('nm,enm->e', K_e1, f_mtx)[:, None]
+                              * K['const'][None, :])
 
         # chi_i1 = trace(diag(dk_f_c / (om2 - i*eta)) @ dk_ba)
         # = sum_n dk_f_c[e,n] * s_om2 * dk_ba[n,n]
         dk_ba_diag = np.diag(dk_ba)  # (D,)
-        kpt['chi_i1'][abc] = s_om2 * np.einsum('en,n->e', dk_f_all[dir_c], dk_ba_diag)[:, None].repeat(nomega, axis=1)
+        kpt['chi_i1'][abc] = (s_om2 * np.einsum('en,n->e', dk_f_all[dir_c], dk_ba_diag)[:, None]
+                              * K['const'][None, :])
 
         # chi_e2 = trace(rho2_e @ dk_ca) where rho2_e = r_b * f_mtx / (omega1 - de - i*eta)
         # = sum_{n,m} r_b[n,m] * f_mtx[e,n,m] * denom1[n,m,w] * dk_ca[m,n]
@@ -399,6 +489,7 @@ def _process_kpoint_fast(
         # chi_i2 = trace(diag(dk_f_b / (om1 - i*eta)) @ dk_ca)
         # = sum_n dk_f_b[e,n] * s_om1[w] * dk_ca[n,n]
         dk_ca_diag = np.diag(dk_ca)
-        kpt['chi_i2'][abc] = np.einsum('en,n->e', dk_f_all[dir_b], dk_ca_diag)[:, None] * s_om1[None, :]
+        kpt['chi_i2'][abc] = (np.einsum('en,n->e', dk_f_all[dir_b], dk_ca_diag)[:, None]
+                              * K['om1'][None, :])
 
     return kpt

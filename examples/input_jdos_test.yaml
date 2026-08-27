@@ -1,0 +1,37 @@
+# Joint density of states on the 2D square sp_u model (same system as
+# input_nonlinear_test.yaml and input_delta_Q_test.yaml, so the JDOS peaks
+# can be read against the chi^(2) resonances of that model).
+#
+# D(omega) = (1/N_k) Sum_k Sum_{n!=m} [f(E_m) - f(E_n)] * L(E_n - E_m - omega, eta)
+#
+# Note: only the FIRST entry of eflist is used -- the engine is
+# single-Fermi-level by construction.
+
+system:
+  basis: sp_u
+  lattice_vectors: [[1,0,0],[0,0,1],[0,10,0]]
+  lattice_type: 2d_square
+  Nx: 1
+  Ny: 1
+
+hopping:
+  range: 1.5
+  tss_sigma: -0.5
+  tsp_sigma: 0.7071067811865475
+  tpp_sigma: 1.0
+
+onsite:
+  u_s: 10.0
+  u_p: 0.0
+
+calc:
+  type: jdos
+  nk: [80, 80]              # per active lattice direction; a bare int also works
+  eflist: [2.0]
+  kT: 0.025                 # optional, default 0.025
+  eta: 0.05                 # Lorentzian width; optional, default 0.05
+  omega_range: [0.0, 5.0]   # optional, default [0, 5]
+  nomega: 200               # optional, default 200
+  # omegalist: [...]        # alternative to omega_range/nomega
+  bands: all                # optional; or a list of band indices
+  outputfile: jdos_test

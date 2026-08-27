@@ -1,0 +1,45 @@
+# Gapped graphene (honeycomb, one s orbital per site, staggered on-site).
+#
+# Maps onto Eq. 1 of tmd_warping_note_corrected.pdf near K/K':
+#   H_tau = v(tau kx sx + ky sy) + lam[(kx^2-ky^2)sx - 2 tau kx ky sy] + m sz
+# with (a = NN distance, T = tss_sigma):
+#   v = 3 T a / 2,   lam = -3 T a^2 / 8,   m = (u_s^A - u_s^B)/2
+#   => lam/v = -a/4  (locked by NN honeycomb geometry)
+#
+# Orientation matters: the note's T*M_x symmetry needs M_x to swap valleys,
+# i.e. Gamma-K along x-hat.  That is achieved by putting the A-B bond along
+# y-hat (NOT along x-hat, which is rotated 90 deg and swaps the roles of the
+# x-odd and y-odd response chains).
+#
+# a = 1, T = 1  =>  v = 1.5, lam = -0.375, gap = 2m.
+
+system:
+  basis: s_u                       # spinless, 1 orbital/site -> genuine 2-band model
+  lattice_vectors:
+    - [ 0.8660254037844386, -1.5, 0.0]   # a1 = a(sqrt3/2, -3/2, 0)
+    - [ 0.8660254037844386,  1.5, 0.0]   # a2 = a(sqrt3/2,  3/2, 0)
+    - [ 0.0,                 0.0, 20.0]  # vacuum
+  positions:
+    - {species: A, coord: [0.0, 0.0, 0.0]}
+    - {species: B, coord: [0.0, 1.0, 0.0]}   # bond along +y => Gamma-K along x
+
+hopping:
+  range: 1.1                       # NN only (NNN sits at sqrt(3) = 1.732)
+  tss_sigma: 1.0                   # T; overall sign is a gauge
+
+onsite:
+  A: {u_s:  0.1}                   # +m
+  B: {u_s: -0.1}                   # -m   => m = 0.1, gap = 0.2
+
+calc:
+  type: band_structure
+  kpath:
+    points:                        # fractional reciprocal coordinates
+      Gamma: [0.0,       0.0,       0.0]
+      K:     [0.3333333, 0.3333333, 0.0]
+      M:     [0.5,       0.0,       0.0]
+    path: [Gamma, K, M, Gamma]
+    npoints: 200
+
+output:
+  file: honeycomb_m0.1

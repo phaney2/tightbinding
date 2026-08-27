@@ -1,0 +1,31 @@
+# Local Notes — tightbinding on this machine
+
+TEMPLATE. On a new machine: `cp CLAUDE.local.md.example CLAUDE.local.md` and fill in.
+`CLAUDE.local.md` is gitignored; this template is tracked.
+
+Put here anything that is true of *this checkout on this machine*. Put facts about the
+machine itself (which Python, which MPI launcher and its flags, shell quirks) in
+`~/.claude/CLAUDE.md` instead — that file is outside all repos and is loaded for every
+project. Keep both kinds out of the tracked `CLAUDE.md`.
+
+Last verified: <DATE>
+
+## External documents
+
+`CLAUDE.md` refers to these by filename only. Record where they live here, or record
+that they are absent — "absent" is useful information and stops a stale path being
+treated as real.
+
+| Referred to in CLAUDE.md as | Location on this machine |
+|---|---|
+| `tmd_warping_note_corrected.pdf` | `<path, or NOT PRESENT>` |
+| `revised_formula_sheet_eta.pdf`  | `<path, or NOT PRESENT>` |
+
+## MATLAB reference source
+
+`master_response` — `<path, or NOT PRESENT>`
+
+## Anything else machine-local
+
+Scheduler/queue details, scratch directories, non-default output locations, an MPI rank
+count that suits this box, etc.

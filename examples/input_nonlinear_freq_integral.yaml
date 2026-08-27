@@ -1,0 +1,54 @@
+# Analytic frequency-integrated chi^(2) on the gapped honeycomb.
+#
+#   J = int_{omega_min}^{omega_max}  domega  omega^(-p)  chi^(2)(omega)
+#
+# evaluated from closed-form antiderivatives (calc/freq_integral.py), not by
+# quadrature over an omega mesh.  Same model as examples/honeycomb_warp/;
+# D3h forces chi_yyy = -chi_yxx = -chi_xxy = -chi_xyx and kills every triplet
+# containing z, which the integrated output must reproduce.
+#
+# Choosing omega_min.  The window is two-sided:
+#
+#     ~10 * eta  <<  omega_min  <<  E_gap
+#
+# Below ~5*eta the poles at -i*eta and -2i*eta (from the 1/(omega + i eta)
+# vertices) sit on top of the omega^(-p) endpoint and the answer stops being a
+# property of the physics; that is a hard error.  Above ~0.1*E_gap the
+# integral no longer starts well below the gap, which is a warning.  The
+# window is only non-empty for eta << E_gap/10 -- here gap = 0.2 and
+# eta = 1e-3, so omega_min = 0.01 sits comfortably in the middle.
+#
+# Omitting omega_min defaults it to 10*eta.
+
+system:
+  basis: s_u
+  lattice_vectors:
+    - [ 0.8660254037844386, -1.5, 0.0]
+    - [ 0.8660254037844386,  1.5, 0.0]
+    - [ 0.0,                 0.0, 20.0]
+  positions:
+    - {species: A, coord: [0.0, 0.0, 0.0]}
+    - {species: B, coord: [0.0, 1.0, 0.0]}   # bond along +y => Gamma-K along x
+
+hopping:
+  range: 1.1
+  tss_sigma: 1.0
+
+onsite:
+  A: {u_s:  0.1}
+  B: {u_s: -0.1}                   # m = 0.1, gap = 0.2
+
+calc:
+  type: nonlinear_optical
+  nk: [120, 120]
+  freq_integral:
+    p: [1, 2]                      # scalar or list; one output column per p
+    omega_min: 0.01                # default is 10*eta
+    omega_max: .inf                # default
+  omega2: 0.0
+  eta: 1.0e-3
+  eta_sos: 1.0e-8                  # bands never degenerate; keep off the gap
+  eflist: [0.0]
+  kT: 1.0e-5
+  directions: ['yyy', 'yxx', 'xxy', 'xyx', 'xxx', 'yyx']
+  outputfile: honeycomb_freq_integral

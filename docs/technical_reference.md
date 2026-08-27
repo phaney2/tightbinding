@@ -21,8 +21,13 @@ tightbinding/
 │   ├── bands.py             # Band structure along k-path
 │   ├── all_ek.py            # Full BZ eigenvalues + DOS
 │   ├── nonlinear_optical.py # Second-order nonlinear optical response χ^(2)
+│   ├── nonlinear_optical_fast.py # Vectorized χ^(2) kernel (the one actually called)
+│   ├── freq_integral.py     # Closed-form ∫dω ω^(-p)(...) for integrated χ^(2)
 │   ├── quantum_metric.py    # Quantum metric tensor + linear response
-│   └── delta_Q.py           # DC field-induced quantum geometric tensor change
+│   ├── delta_Q.py           # DC field-induced quantum geometric tensor change
+│   └── jdos.py              # Joint density of states
+│
+├── parallel.py                  # MPI wrapper (mpi4py, serial fallback)
 │
 ├── wannier.py                   # Wannier90 _hr.dat / _tb.dat parsers + System builders
 │
@@ -62,7 +67,11 @@ _dispatch()            [main.py]
     ├─ band_structure  → compute_band_structure()  [calc/bands.py]
     ├─ all_ek          → compute_all_ek()          [calc/all_ek.py]
     ├─ nonlinear_optical → compute_nonlinear_optical() [calc/nonlinear_optical.py]
-    └─ quantum_metric  → compute_quantum_metric()  [calc/quantum_metric.py]
+    │                      └─ sampled ω list, or analytic ∫dω ω^(-p) via
+    │                         [calc/freq_integral.py]
+    ├─ quantum_metric  → compute_quantum_metric()  [calc/quantum_metric.py]
+    ├─ delta_Q         → compute_delta_Q()         [calc/delta_Q.py]
+    └─ jdos            → compute_jdos()            [calc/jdos.py]
 ```
 
 The NRL path bypasses `lattice.py` and `hamiltonian.py`, instead using
@@ -546,7 +555,9 @@ Falls back to lattice vector norms if no off-site hoppings are found.
 
 #### `compute_nonlinear_optical(system, cfg) -> dict`
 
-Computes χ^(2)_abc(ω1, ω2) using density-matrix perturbation theory.
+Computes χ^(2)_abc(ω1, ω2) using density-matrix perturbation theory. The
+per-k-point work is done by `nonlinear_optical_fast._process_kpoint_fast`;
+`_process_kpoint` in this module is the unvectorized reference and must track it.
 
 **At each k-point:**
 1. `get_H_v(order=2)` → H, S, first and second velocity operators
@@ -564,6 +575,159 @@ Computes χ^(2)_abc(ω1, ω2) using density-matrix perturbation theory.
 Each component has shape `(nef, nomega)`.
 
 **k-grid:** BZ-centered: `tk = -b1/2 - b2/2 + db1·kc1 + db2·kc2`
+
+#### Frequency-integrated mode
+
+Supplying `calc.freq_integral` instead of `calc.omega1list` switches the ω axis
+from *photon energies* to *analytic-integral channels*, returning
+
+```
+J = ∫_{omega_min}^{omega_max} dω ω^(-p) χ^(2)(ω)
+```
+
+The whole feature rests on one structural fact: **ω enters every χ term only
+through denominator factors.** Matrix elements, Fermi factors and vertex
+prefactors are ω-independent, so each term is
+`(ω-independent prefactor) × (rational function of ω)` and the ω-integral can be
+done per term with the prefactor pulled out.
+
+Additional helpers in this module:
+
+- **`_estimate_direct_gap(system, nk_cfg, ef, nk_max=16)`** — minimum direct gap
+  straddling `ef` on a coarse grid (≤16³ points), computed on rank 0 and
+  broadcast. Used only for the `omega_min << E_gap` warning; returns `inf` when
+  no k-point has states on both sides of `ef`.
+- **`_split_freq_integral(result, spec)`** — after the MPI reduce, splits the
+  channel axis into the `J` columns (which keep the original chi names) and the
+  endpoint-diagnostic columns, emitted as extra top-level names
+  `endpt_log_<name>` / `endpt_pow<j>_<name>` for `CHI_PHYSICAL + ['chi_total']`.
+  These names contain no `.`, so the existing `.npz` flat-key save/load works
+  unchanged.
+
+Rejected configurations: `omega1list` together with `freq_integral`;
+`method='projector'` with `freq_integral` (the projector χ_e path assumes a
+sampled ω list).
+
+---
+
+### `calc/nonlinear_optical_fast.py`
+
+#### `_process_kpoint_fast(..., freq_integral=None)`
+
+Vectorized per-k-point kernel. All arrays carry a trailing length-`W` axis.
+That axis is an **ω axis, not necessarily a list of photon energies**: every
+phase-3 contraction is linear in the ω-dependent kernels, so substituting
+integrated kernels for sampled ones turns the same code into the integrated
+engine. `freq_integral=None` gives the historical sampled behaviour.
+
+#### `_build_omega_kernels(de_mtx, omega1list, omega2_val, eta_val, freq_integral)`
+
+The single place ω-dependent factors are formed — the reason the two modes
+cannot drift. Returns `(K, denom2, denom2_sq, s_om2)`.
+
+| kernel | shape | factor |
+|---|---|---|
+| `d1` | (D,D,W) | `1/(ω - Δe + iη)` |
+| `d12` | (D,D,W) | `1/(ω + ω₂ - Δe + 2iη)` |
+| `d12_d1` | (D,D,W) | product of the two above, same band pair |
+| `d12_d1sq` | (D,D,W) | `d12 · d1²` |
+| `d12_om1` | (D,D,W) | `d12 · 1/(ω + iη)` |
+| `om1`, `om12`, `om12_om1` | (W,) | band-independent scalar denominators |
+| `const` | (W,) | `1` (sampled) / `∫dω ω^(-p)` (integrated) |
+| `ee1A` | (D,D,D,W) | `[m,n,p] = d12[m,n]·d1[m,p]` |
+| `ee1B` | (D,D,D,W) | `[m,n,p] = d12[m,n]·d1[p,n]` |
+
+Two subtleties this table encodes:
+
+- **`denom1` and `denom12` carry different broadening** (`iη` vs `2iη`), so
+  their poles sit at different points and `d12_d1` is *not* `1/(ω-z)²`. It needs
+  a genuine two-pole kernel; a single-pole formula is insufficient.
+- **`denom2` and `s_om2` depend only on the fixed ω₂**, so they pass straight
+  through the integral as constants and multiply the integrated kernels
+  (`d12_d2 = denom2 · d12`). Only factors that actually depend on ω need a
+  kernel.
+
+`chi_ee1` is the one term whose two ω-factors sit at *different band pairs*, so
+its kernel needs three band indices and does not factorize once integrated.
+Both modes therefore use the (D,D,D,W) form; that reassociates its
+floating-point sum (~8e-15 vs. the pre-refactor code — every other term is
+bit-identical).
+
+`chi_e1` and `chi_i1` have no ω dependence at all, so their kernel is `const`.
+
+---
+
+### `calc/freq_integral.py`
+
+#### `rational_integral(p, poles, mults, a, b=inf, want_cond=False)`
+
+```
+∫_a^b dω / ( ω^p ∏_i (ω - z_i)^(s_i) )
+```
+
+for integer `p >= 0` and arbitrary multiplicities, vectorized over arrays of
+poles. Returns `(J, A[, cond])`, where `A[j-1]` is the partial-fraction
+coefficient `A_j` and `cond` is the cancellation ratio.
+
+Preconditions, all guaranteed by the calling kernels when `eta > 0`:
+
+- **`Im z_i < 0` for every pole.** The χ denominators are retarded, so
+  `1/(ω - ω_nm + iη) = 1/(ω - z)` with `z = ω_nm - iη`. This is what makes the
+  log branch unambiguous: for real `ω > 0` both `a - z` and `b - z` have
+  positive imaginary part, so their principal arguments lie in `(0, π)`.
+  Logs are always evaluated as **differences of principal logs**, never as
+  `log((b-z)/(a-z))`, which can cross the cut.
+- **Poles distinct.** Pairs that occur share a real part but differ by `iη`.
+  Genuine repeated poles are passed as a multiplicity, not as two entries.
+- **`a > 0`.**
+
+`b = inf` is handled by dropping all upper-endpoint terms, which is exact:
+whenever `p + Σs_i >= 2` the simple-pole residues sum to zero, so the log terms
+cancel and the antiderivative vanishes at infinity. `J = -F(a)`, with no
+large-`b` cancellation. When `p + Σs_i < 2` the limit does not exist and `J` is
+returned as NaN (`A` is still filled, since it describes the `a` endpoint).
+
+#### `partial_fractions(p, poles, mults) -> (A, B)`
+
+Coefficients of
+
+```
+1/(ω^p ∏(ω-z_i)^s_i) = Σ_j A_j/ω^j + Σ_i Σ_l B_{i,l}/(ω-z_i)^l
+```
+
+obtained by Taylor-expanding the *complementary* factors about each pole
+(`_series_inv_power` + `_series_mul`). Numerically identical to the closed-form
+generalized-binomial expressions, but with no special case for negative
+binomial arguments — the direct formula needs `C(-1, 0)` in a legitimate case,
+which `math.comb` rejects.
+
+#### `class FreqIntegralSpec`
+
+Config parsing, validation and channel bookkeeping. Channels per requested `p`:
+
+| channel | meaning |
+|---|---|
+| `('J', 0)` | the integral |
+| `('log', 1)` | coefficient of `ln(omega_min)` in J, i.e. `-A_1` (0 when p=0) |
+| `('pow', j)` | coefficient of `omega_min^(1-j)`, i.e. `A_j/(j-1)`, j = 2..pmax |
+
+- `from_config(block, eta, gap=None)` applies the guards
+  (`OMEGA_MIN_ETA_ERROR = 5`, `OMEGA_MIN_ETA_WARN = 10`, `OMEGA_MIN_GAP_WARN = 0.1`);
+  `omega_min` defaults to `10*eta`, `eta <= 0` is rejected.
+- `kernel(poles, mults)` returns the integrated kernel, shape
+  `broadcast(poles) + (nchan,)`, one `rational_integral` call per power.
+- `max_cond` accumulates the worst cancellation ratio seen; the driver
+  MPI-max-reduces it and prints it.
+
+**Conditioning.** At ω₂ = 0 the `z12`/`z1` pair is separated by exactly `iη`,
+i.e. nearly coincident on the scale over which the integrand varies. The
+`1/(z₁ - z₂)` factors in the partial fractions cancel against each other,
+costing roughly `log10(|z|/η)` digits per unit of excess multiplicity — about 8
+digits for the `s = 3` kernel at η = 1e-3. Measured end-to-end accuracy there is
+~1e-8.
+
+**Tests:** `examples/test_freq_integral.py` (8 groups, including a
+sampled-mode regression against a `git worktree` baseline passed as `argv[1]`).
 
 ---
 
@@ -588,6 +752,105 @@ Each component has shape `(nef, nomega)`.
      — extrinsic (Fermi surface)
 
 **Degeneracy handling:** Pairs with `|ΔE| < 1e-5` are masked out (zero contribution).
+
+---
+
+### `calc/delta_Q.py`
+
+#### `compute_delta_Q(system, cfg) -> dict`
+
+DC field-induced change in the quantum geometric tensor, δQ^{ab} for a static
+field along `c`. Implements Eq. 40 of `revised_formula_sheet_eta.pdf`.
+
+> ⚠️ Shares `_compute_A_W_k` with `nonlinear_optical.py`, which is currently
+> broken for Wannier input — see `BUG_wannier_r_correction.md`. TB_simple
+> systems are unaffected: `bloch.py` builds H(k) in the atomic gauge, where the
+> tight-binding position operator is exactly `r = -i v/ω` with no intra-cell
+> correction, so `_compute_A_W_k` correctly returns `None`.
+
+**Returns** `{'Q_tilde': {}, 'delta_Q': ..., 'delta_Q_terms': ...}` with
+`delta_Q[a][b][c] -> array(nef,)`. `Q_tilde` is always empty.
+
+**Broadening — three distinct parameters, easily confused:**
+
+| symbol | where it enters |
+|---|---|
+| `eta` | the DC-perturbation denominators only: `1/(ω_nm ± iη)` |
+| `eta_sos` | Souza regularization of the *bare* `1/ω_nm`: `ω/(ω² + η_sos²)` |
+| — | projector-derivative factors (`v/ω`) stay bare apart from `eta_sos` |
+
+The `+iη`/`−iη` split across Trace II and Trace III is what preserves
+Hermiticity of δP_n. `eta_sos` defaults to `0.05`, large enough to matter in
+low-energy models. `deg_thr` is accepted for backward compatibility, ignored,
+and warned about once.
+
+**Two formulations**, selected by `dQ_occupied_subspace` (default `True`):
+
+- **Subspace** (`_assemble_delta_Q_subspace`) — responds
+  `Q_occ = Tr[P_occ ∂ₐP_occ ∂_b P_occ]`. The outer (p,q) sum is masked by
+  `f_p (1 - f_q)`, and an extra `T_mix` term appears from inner three-band sums
+  whose intermediate index is restricted to the occupied manifold. Note the
+  derivation literally gives `f_p (f_q - f_p)`; the code uses `f_p (1 - f_q)`
+  for consistency with the interband convention elsewhere, differing by a
+  self-smear term negligible for `kT ≪ gap`.
+- **Band-resolved** (`_assemble_delta_Q`) — `Σ_n f_n δQ^{ab}_n`, 6 terms, no
+  `T_mix`.
+
+Both share `_compute_pair_matrices`, which returns the pair integrands before
+the outer contraction; only the outer mask differs. That is what keeps the two
+paths from drifting.
+
+**Term names:** `T_Sipe_Delta`, `T_Sipe_d2H`, `T_Sipe_3band`,
+`T_Sipe_wannier_corr`, `T_Delta`, `T_3band` (+ `T_mix` in the subspace path).
+The four `T_Sipe_*` pieces sum exactly to the full Sipe generalized derivative —
+`wannier_corr` is pre-populated with zeros so the bookkeeping holds whether or
+not the system carries Wannier position matrices.
+
+**k-grid:** 2D only — `nk1, nk2 = calc['nk']` unpacks exactly two entries.
+Periodic spacing `db = b/nk`.
+
+**Sign convention:** the implemented Eq. 40 corresponds to `H' = -E·r`; notes
+written with `H' = +E·r` differ by an overall minus, verified pointwise.
+
+**Serialization caveat:** `_save_delta_Q` writes the term decomposition under
+5-part keys `delta_Q_terms.<a>.<b>.<c>.<term>`, but `load_delta_Q` only handles
+3- and 4-part keys, so those entries are silently dropped on reload. Read them
+with `np.load` directly.
+
+---
+
+### `calc/jdos.py`
+
+#### `compute_jdos(system, cfg) -> dict`
+
+```
+D(ω) = (1/N_k) Σ_k Σ_{n≠m} [f(E_m) - f(E_n)] · L(E_n - E_m - ω, η)
+L(x, η) = (1/π) η / (x² + η²)
+```
+
+**At each k-point:** `get_H_k` → `diagonalize_hk` (eigenvectors not needed) →
+optional band restriction → build `de[n,m]` and `f_mn[n,m]` → broadcast the
+Lorentzian over ω as a `(nomega, N, N)` array and sum the two band axes.
+
+Dimensionality comes from `all_ek.detect_dimensionality`; `nk` is broadcast from
+a scalar or padded/truncated to `ndim` entries.
+
+**Returns** a flat dict: `omega`, `jdos`, `ef`, `eta`, `kT`, `nk`, `ndim`.
+
+Notes for anyone extending this:
+
+- Only `eflist[0]` is used — the engine is single-Fermi-level by construction.
+- `bands` indexes into the *sorted* eigenvalue array at each k, so a fixed index
+  list does not follow a band through a crossing.
+- The reduction goes through `reduce_sum_complex_array` on a cast-to-complex
+  copy, then takes `.real`, because `parallel.py` has no real-array sum reducer
+  wired in here.
+- There is no `load_jdos` in `main.py`; `_save_jdos` exists but the read path is
+  plain `np.load`.
+- **k-grid:** uses `db = b/(nk-1)` (endpoint-inclusive), mirroring `all_ek` and
+  *unlike* the periodic `db = b/nk` used by the response engines. Both zone
+  edges are sampled while the `1/N_k` weight is unchanged, an O(1/nk) bias in
+  the absolute normalization. See the k-grid convention note in `CLAUDE.md`.
 
 ---
 
@@ -646,6 +909,8 @@ e_orb = a + b·ρ^(2/3) + c·ρ^(4/3) + d·ρ²
 
 4. **Shared Bloch machinery**: All calc engines use the same `get_H_k` / `get_H_v` functions. Reciprocal lattice computation and eigenvalue solving are centralized in `bloch.py`.
 
-5. **Multiprocessing parallelism**: k-point parallelism via `multiprocessing.Pool` with a module-level global initializer pattern. Each worker stores a reference to the `System` to avoid pickling overhead.
+5. **MPI parallelism**: k-point parallelism via `parallel.py`, a thin `mpi4py` wrapper that scatters k-points round-robin and all-reduces the per-rank accumulators. When `mpi4py` is absent the same code path runs serially, so engines need no branching.
 
 6. **Embedded config in output**: Every `.npz` file stores the full config as JSON, ensuring reproducibility.
+
+7. **One place per ω-dependence**: In χ^(2), ω enters only through denominator factors. `_build_omega_kernels` is the sole place those are formed, with sampled and analytically-integrated backends behind one interface. The term algebra downstream is shared verbatim, so the two modes cannot drift — the alternative, a parallel copy of the ~15 term expressions, is the drift risk already flagged between `nonlinear_optical.py` and `nonlinear_optical_fast.py`.

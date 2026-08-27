@@ -1,0 +1,109 @@
+# =====================================================================
+# Gapped graphene (trigonally-warped Dirac valleys): field-induced
+# quantum metric  dg^{ab}(E_c),  compared to Eq. 15 of
+#   C:\Users\phaney\wrk\dQ\tmd_warping_note_corrected.pdf
+#
+# Run:
+#     python3 -m tightbinding examples/honeycomb_warp/delta_Q.yaml
+#     mpiexec -np 8 python3 -m tightbinding examples/honeycomb_warp/delta_Q.yaml
+#
+# (MS-MPI block-buffers piped stdout: progress appears only at the end.)
+# ---------------------------------------------------------------------
+#
+# MODEL.  Honeycomb lattice of spinless s orbitals, NN hopping only,
+# staggered on-site energy +-m.  Expanding about K gives exactly the
+# note's Eq. 1 to O(q^2):
+#
+#     v = 3*T*a/2 = 1.5     lam = -3*T*a^2/8 = -0.375     m = 0.1
+#
+# ORIENTATION IS NOT FREE.  The note's T*M_x selection rule needs M_x to
+# swap valleys => Gamma-K along x-hat => the A-B bond points along +y-hat.
+# Rotating this 90 deg swaps which response channel survives.
+#
+# lam/v = -a/4 is LOCKED by NN geometry, so Eq. 15 collapses to a
+# hopping-independent prediction (both valleys):
+#
+#     T^yyy = int d2k dg^yy(E_y) = pi*a/(4m) = 7.853982
+#
+# TWO POST-PROCESSING STEPS ARE REQUIRED (see bottom of this file):
+#   1. the engine returns the BZ *average*; multiply by the BZ area
+#      (2*pi)^2 / (3*sqrt(3)/2 * a^2) = 15.19525
+#   2. the engine uses H' = -E.r, the note uses H' = +E.r, so the code
+#      output is -1 x the note's value.  Convention, not a bug.
+# =====================================================================
+
+system:
+  basis: s_u                      # one spinless s orbital per site
+  lattice_vectors:
+    - [ 0.8660254037844386, -1.5, 0.0]   # a1 = a*(sqrt3/2, -3/2, 0)
+    - [ 0.8660254037844386,  1.5, 0.0]   # a2 = a*(sqrt3/2,  3/2, 0)
+    - [ 0.0,                 0.0, 20.0]  # vacuum (2D)
+  positions:
+    - {species: A, coord: [0.0, 0.0, 0.0]}
+    - {species: B, coord: [0.0, 1.0, 0.0]}   # bond along +y  <-- required
+
+hopping:
+  range: 1.1                      # NN only; NNN sits at sqrt(3) = 1.732
+  tss_sigma: 1.0                  # T
+
+onsite:
+  A: {u_s:  0.1}                  # +m
+  B: {u_s: -0.1}                  # -m   =>  gap = 2m = 0.2
+
+calc:
+  type: delta_Q
+
+  components: [xx, xy, yx, yy]    # (a,b) pairs of dg^{ab}
+  field_direction: [x, y]         # DC field direction c
+                                  # -> all 8 T^{abc}; the four with an odd
+                                  #    number of x's must vanish (~1e-16)
+                                  #    by the T*M_x rule, and
+                                  #    yyy = -yxx = -xxy = -xyx by C3.
+
+  nk: [401, 401]                  # 401^2 = 160801 k-points, ~1 min on 8 ranks
+
+  eflist: [0.0]                   # mid-gap
+  kT: 0.002                       # = m/50, well below the gap
+  eta: 0.0                        # note's identity is unbroadened
+  eta_sos: 1.0e-8                 # DEFAULT IS 0.05 -- comparable to the gap
+                                  # here, and would silently corrupt the
+                                  # result.  Safe to make tiny: the two
+                                  # bands are never degenerate.
+
+  outputfile: honeycomb_dQ_m0.1   # writes honeycomb_dQ_m0.1.npz
+
+# =====================================================================
+# READING THE RESULT
+#
+#   import numpy as np
+#   from tightbinding.main import load_delta_Q
+#   res, cfg = load_delta_Q('honeycomb_dQ_m0.1')
+#   BZ = (2*np.pi)**2 / (1.5*np.sqrt(3))          # = 15.19525
+#   for a in 'xy':
+#       for b in 'xy':
+#           for c in 'xy':
+#               print(a+b+c, BZ * res['delta_Q'][a][b][c][0].real)
+#
+# EXPECTED (m = 0.1, nk = 401) -- verified output:
+#
+#   yyy  -7.881724     <-- |.| vs. pi*a/(4m) = 7.853982   (0.35% high)
+#   yxx  +7.883332
+#   xyx  +7.883332
+#   xxy  +7.878507
+#   xxx, xyy, yxy, yyx   <= 2e-14      (T*M_x selection rule)
+#
+# Raw (un-multiplied) BZ average of the yyy channel: -0.5186965.
+#
+# The C3 chain yyy = -yxx = -xxy = -xyx holds only to ~6e-4 relative here:
+# a uniform nk1 x nk2 grid on a hexagonal BZ is not itself C3-symmetric, so
+# the chain tightens as nk grows.  The T*M_x zeros, by contrast, are exact
+# at any nk -- they come from cancellation at each k, not from the grid.
+#
+# The overall minus sign is the H' = -E.r vs. +E.r convention.  The
+# residual few-tenths of a percent is physical, not numerical: it is the
+# O(lam^3) + lattice correction to the note's leading-order Eq. 15, and
+# it shrinks with m/T.  Set u_s = +-0.05 (and kT = 0.001) to see it drop
+# to ~0.04% against the then-larger prediction 15.707963; nk must grow
+# with 1/m to keep the k-grid resolving the m/v-scale peak (nk = 801 is
+# appropriate at m = 0.05).
+# =====================================================================

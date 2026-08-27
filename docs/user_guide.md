@@ -332,6 +332,110 @@ result, cfg = load_nonlinear_optical('results/chi2')
 # result['chi_ii']['x']['z']['x']  — array(nef, nomega)
 ```
 
+### Frequency-Integrated χ^(2) (`nonlinear_optical` + `freq_integral`)
+
+The same engine can return the **frequency-integrated** response
+
+```
+J = ∫ dω  ω^(-p)  χ^(2)(ω)
+```
+
+computed from closed-form antiderivatives rather than by quadrature over an ω
+mesh. Replace `omega1list` with a `freq_integral` block — supplying both is an
+error:
+
+```yaml
+calc:
+  type: nonlinear_optical
+  nk: [120, 120]
+  freq_integral:
+    p: [1, 2]           # ω^(-p) weight; scalar or list, one output column each
+    omega_min: 0.01     # optional — defaults to 10*eta
+    omega_max: .inf     # optional — default
+    diagnostics: true   # optional — default
+  omega2: 0.0
+  eta: 1.0e-3
+  eta_sos: 1.0e-8
+  eflist: [0.0]
+  kT: 1.0e-5
+  directions: ['yyy', 'yxx']
+  outputfile: results/chi2_int
+```
+
+Use this instead of integrating `omega1list` numerically: matching the closed
+form by quadrature needs ~10⁶ ω-points per k-point, and adaptive integrators do
+*worse*, not better, because the sharpest terms have an integrand peaking at
+~1/η³ that integrates to O(1).
+
+**Choosing `omega_min` — the window is two-sided:**
+
+```
+~10·eta  <<  omega_min  <<  E_gap
+```
+
+The lower bound is not cosmetic. Several vertices contribute poles at `ω = -iη`
+and `-2iη`, sitting right on top of the `ω^(-p)` endpoint. Below `ω ~ η` the
+integrand changes character, so an `omega_min` inside that crossover makes `J` a
+function of the η/`omega_min` interplay rather than of the physics. The code
+enforces this:
+
+| condition | behaviour |
+|---|---|
+| `omega_min` omitted | set to `10*eta` |
+| `omega_min < 5*eta` | **hard error** |
+| `omega_min < 10*eta` | warning |
+| `omega_min > 0.1*E_gap` | warning (gap estimated on a coarse pre-pass) |
+| `eta = 0` | **hard error** |
+
+Both bounds together require `eta << E_gap/10`. A model with gap 0.2 eV and
+`eta = 0.025` has **no valid window at all** — reduce `eta` rather than
+`omega_min`.
+
+**What converges at `omega_max: .inf`:**
+
+- `p >= 2` — every term.
+- `p = 1` — everything except `chi_e1` and `chi_i1`, which are ω-independent and
+  come back as **NaN**. Both are unphysical and already excluded from
+  `chi_total`, so nothing else is affected.
+- `p = 0` — several terms diverge individually; set a finite `omega_max`.
+
+**Output:**
+- Same `result[name][a][b][c]` nesting and same `.npz` save/load, but arrays are
+  shape `(nef, n_p)` — one column per requested power, in the order given.
+- Reported in the **same convention as the sampled path**, so `Im[J]` is the
+  reactive part and `-Re[J]` the dissipative one.
+- Extra keys `endpt_log_<name>` and (for p ≥ 2) `endpt_pow<j>_<name>`, for the
+  seven physical terms and `chi_total` — see below.
+
+```python
+from tightbinding.main import load_nonlinear_optical
+result, cfg = load_nonlinear_optical('results/chi2_int')
+J = result['chi_total']['y']['y']['y']       # (nef, n_p); column 0 is p=1
+lncoef = result['endpt_log_chi_total']['y']['y']['y']
+```
+
+**`omega_min` dependence — read the diagnostic, don't assume it cancels.**
+Each term diverges as `omega_min → 0`, and the `endpt_*` keys hold the
+coefficients of that divergence, BZ-accumulated. Two exact identities apply:
+
+```
+p = 1:  coefficient of ln(omega_min)   = -chi(omega=0)
+p = 2:  coefficient of omega_min^(-1)  = +chi(omega=0)
+        coefficient of ln(omega_min)   = -dchi/domega (0)
+```
+
+So **at p = 1 the integral is genuinely log-divergent as `omega_min → 0`**,
+with coefficient `-χ^(2)(0)`; the individual-term divergences only partly
+cancel. Always quote `J` together with the `omega_min` it was computed at. If
+the diagnostic comes back at round-off, `J` is `omega_min`-independent and you
+can say so.
+
+**Accuracy.** The run prints a worst-case cancellation ratio; its base-10 log is
+roughly the number of digits lost to the nearly-coincident poles that the
+broadening creates. At `eta = 1e-3` this is ~8 digits in the worst kernel, with
+measured end-to-end accuracy ~1e-8 — still two orders better than what a fine ω
+mesh achieves. Larger `eta` is better conditioned.
+
 ### Quantum Metric (`quantum_metric`)
 
 Computes the quantum metric tensor Q and its DC linear response (intrinsic dQ and extrinsic dQf) over the Brillouin zone.
@@ -362,6 +466,128 @@ result, cfg = load_quantum_metric('results/qm')
 # result['Q']['x']['z']       — array(nef,)
 # result['dQ']['x']['z']['x'] — array(nef,)
 ```
+
+### DC Field-Induced Quantum Geometry (`delta_Q`)
+
+Computes δQ^{ab}, the change in the quantum geometric tensor produced by a
+static electric field along direction `c`, with adiabatic iη broadening.
+
+> ⚠️ **Read the blocking-bug notice in `CLAUDE.md` before running this on
+> Wannier (`_tb.dat`) input.** `delta_Q` shares the Wannier-gauge position
+> correction with χ^(2), and that function is currently broken — it makes
+> `delta_Q` complex when it must be real. Systems built from YAML (TB_simple)
+> are unaffected, because the atomic gauge needs no such correction.
+
+```yaml
+calc:
+  type: delta_Q
+  nk: [60, 60]              # 2D grid — exactly two entries required
+  eflist: [2.0]             # Fermi energies
+  kT: 0.1                   # temperature (eV)
+  eta: 0.1                  # adiabatic broadening (optional, default 0.0)
+  eta_sos: 0.05             # Souza regularization of 1/w_nm (optional)
+  components: [xz, zx]      # (a,b) metric index pairs, or 'all'
+  field_direction: x        # DC field direction c — string or list
+  directions: [x, z]        # only needed when components: 'all'
+  outputfile: results/dQ
+```
+
+Additional switches, both defaulting to `true`:
+
+- `wannier_r` — apply the Wannier-gauge position correction when the system
+  carries one. Set `false` only for diagnostic comparison against the bare
+  tight-binding form; it is *not* a fix for the bug above.
+- `dQ_occupied_subspace` — respond the occupied-subspace tensor
+  `Q_occ = Tr[P_occ ∂ₐP_occ ∂_b P_occ]`, restricting the outer band sum to
+  occupied→unoccupied pairs. Setting `false` reverts to the band-resolved
+  `Σ_n f_n δQ_n` form and drops the extra `T_mix` term.
+
+`deg_thr` is accepted but ignored (it was replaced by the `eta_sos`
+regularization); the code warns once if you pass it.
+
+**Output:**
+- `result['delta_Q'][a][b][c]` → complex array of shape `(nef,)`
+- `result['delta_Q_terms'][a][b][c][term]` → same shape, per-term breakdown.
+  Terms: `T_Sipe_Delta`, `T_Sipe_d2H`, `T_Sipe_3band`, `T_Sipe_wannier_corr`,
+  `T_Delta`, `T_3band`, plus `T_mix` when `dQ_occupied_subspace` is on.
+- `result['Q_tilde']` is present but always empty.
+
+**Reloading:**
+
+```python
+from tightbinding.main import load_delta_Q
+result, cfg = load_delta_Q('results/dQ')
+# result['delta_Q']['x']['z']['x'] — array(nef,)
+```
+
+Note: `load_delta_Q` returns only `Q_tilde` and `delta_Q`. The per-term
+decomposition *is* written to the `.npz` under keys
+`delta_Q_terms.<a>.<b>.<c>.<term>`, but the loader drops them — read those
+directly with `np.load` if you need them.
+
+**Sign convention.** The implemented formula corresponds to `H' = -E·r`. Notes
+written with `H' = +E·r` give the opposite overall sign; the two agree to
+machine precision in magnitude and structure at every k and every channel.
+
+**Gotcha for small-gap models.** `eta_sos` defaults to `0.05`, which is
+comparable to or larger than the gap in low-energy models — set it to ~`1e-8`
+whenever bands are never degenerate. Set `eta: 0.0` to compare against
+unbroadened analytic results, and keep `kT` well below the gap.
+
+### Joint Density of States (`jdos`)
+
+Computes the Lorentzian-broadened joint density of states
+
+```
+D(ω) = (1/N_k) Σ_k Σ_{n,m} [f(E_m) - f(E_n)] · L(E_n - E_m - ω, η)
+```
+
+with `L` a unit-area Lorentzian standing in for the energy-conserving
+δ-function. The Fermi weight restricts the positive-ω part to
+occupied→unoccupied transitions as T → 0.
+
+```yaml
+calc:
+  type: jdos
+  nk: [80, 80]              # per active lattice direction; a single int works too
+  eflist: [0.0]             # only the FIRST entry is used
+  kT: 0.025                 # optional, default 0.025
+  eta: 0.05                 # Lorentzian width (optional, default 0.05)
+  omega_range: [0.0, 5.0]   # optional, default [0, 5]
+  nomega: 200               # optional, default 200
+  # omegalist: [...]        # alternative: explicit ω values, overrides the above
+  bands: all                # optional; or a list of band indices to include
+  outputfile: results/jdos
+```
+
+Dimensionality is auto-detected, and `nk` is padded or truncated to match, so a
+single integer gives an isotropic grid.
+
+**Output** — a flat dict (and the same keys in the `.npz`):
+
+| key | contents |
+|---|---|
+| `omega` | array(nomega,), eV |
+| `jdos` | array(nomega,), states/eV/unit cell |
+| `ef`, `eta`, `kT` | the scalars actually used |
+| `nk` | grid shape tuple |
+| `ndim` | 1, 2 or 3 |
+
+There is no `load_jdos` helper; read the `.npz` directly:
+
+```python
+import numpy as np, json
+d = np.load('results/jdos.npz', allow_pickle=True)
+omega, jdos = d['omega'], d['jdos']
+cfg = json.loads(str(d['_config_json']))
+```
+
+**Caveat on the k-grid.** `jdos` uses the endpoint-inclusive spacing
+`db = b/(nk-1)`, matching `all_ek` rather than the periodic `db = b/nk` used by
+`nonlinear_optical`, `quantum_metric` and `delta_Q`. That samples both zone
+edges while keeping the `1/N_k` weight, an O(1/nk) bias in the normalization.
+Relative lineshapes are unaffected; treat absolute JDOS magnitudes with care and
+converge in `nk`.
 
 ---
 
@@ -395,9 +621,17 @@ The returned `System` object is compatible with all calculation engines.
 
 ## Parallelization
 
-The `all_ek`, `nonlinear_optical`, and `quantum_metric` engines automatically use all available CPU cores via Python's `multiprocessing.Pool`. The number of cores is detected via `os.cpu_count()`. Progress is printed at 10% intervals for large calculations.
+k-point parallelism goes through MPI (`tightbinding/parallel.py`). When `mpi4py`
+is installed, k-points are scattered round-robin across ranks and the results
+are all-reduced; without it, the same code path runs serially. Progress is
+printed at 10% intervals by rank 0.
 
-For single-core runs (debugging or small grids), the code falls back to a serial loop automatically when `ncpu == 1`.
+```bash
+python3 -m tightbinding input.yaml              # serial
+mpiexec -np 8 python3 -m tightbinding input.yaml  # 8 ranks
+```
+
+The MPI launcher name and its accepted flags vary by machine.
 
 ---
 

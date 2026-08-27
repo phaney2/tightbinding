@@ -14,6 +14,7 @@ from ..bloch import get_H_v, get_H_k, get_reciprocal_lattice, diagonalize_hk
 from ..types import System
 from .. import parallel
 from .nonlinear_optical_fast import _process_kpoint_fast
+from .freq_integral import FreqIntegralSpec
 
 
 # 14 chi component names matching MATLAB
@@ -60,6 +61,17 @@ _DIR = {'x': 0, 'y': 1, 'z': 2}
 def compute_nonlinear_optical(system: System, cfg: dict) -> dict:
     """Compute χ^(2) nonlinear optical response.
 
+    Two modes, selected by the config:
+
+    * **sampled** (``calc.omega1list``) — χ^(2) at each listed photon energy.
+      Output arrays are ``(nef, nomega)``.
+    * **frequency-integrated** (``calc.freq_integral``) — the closed-form
+      ``J = ∫ dω ω^(-p) χ^(2)(ω)`` over ``[omega_min, omega_max]``, evaluated
+      from exact antiderivatives rather than quadrature. Output arrays are
+      ``(nef, n_p)``, one column per requested power ``p``. Additional keys
+      ``endpt_log_<name>`` (and ``endpt_pow<j>_<name>`` for p ≥ 2) carry the
+      lower-endpoint divergence coefficients; see `freq_integral`.
+
     Parameters
     ----------
     system : System with filled Hamiltonian matrices
@@ -67,14 +79,13 @@ def compute_nonlinear_optical(system: System, cfg: dict) -> dict:
 
     Returns
     -------
-    dict with keys for each chi component, each a nested dict [a][b][c] → array(nef, nomega)
+    dict with keys for each chi component, each a nested dict [a][b][c] → array
     """
     calc = cfg['calc']
     nk_cfg = list(calc['nk'])
     if len(nk_cfg) == 2:
         nk_cfg.append(1)
     nk1, nk2, nk3 = nk_cfg
-    omega1list = np.asarray(calc['omega1list'], dtype=float)
     omega2_val = float(calc.get('omega2', 0.0))
     eta_val = float(calc['eta'])
     # Souza-style Lorentzian regularization of the bare 1/w_{nm}:
@@ -89,7 +100,28 @@ def compute_nonlinear_optical(system: System, cfg: dict) -> dict:
     method = calc.get('method', 'sos')  # 'sos' or 'projector'
     lam = float(calc.get('lam', 1e-4))  # finite-diff step for projector
 
-    nomega = len(omega1list)
+    # --- sampled vs frequency-integrated omega axis ---
+    fi_block = calc.get('freq_integral')
+    freq_spec = None
+    omega1list = None
+    if fi_block is None:
+        omega1list = np.asarray(calc['omega1list'], dtype=float)
+        nomega = len(omega1list)
+    else:
+        if 'omega1list' in calc:
+            raise ValueError(
+                "calc: give either 'omega1list' (sampled chi^(2)) or "
+                "'freq_integral' (analytic frequency integral), not both"
+            )
+        if method != 'sos':
+            raise ValueError(
+                f"calc.method='{method}' is not supported with freq_integral; "
+                "the projector chi_e path is built on a sampled omega list"
+            )
+        gap = _estimate_direct_gap(system, nk_cfg, float(eflist[0]))
+        freq_spec = FreqIntegralSpec.from_config(fi_block, eta_val, gap=gap)
+        nomega = freq_spec.nchan
+
     nef = len(eflist)
 
     # Determine unique direction chars needed
@@ -147,6 +179,8 @@ def compute_nonlinear_optical(system: System, cfg: dict) -> dict:
     parallel.print_root(
         f"  Nonlinear optical: {total_jobs} k-points on {parallel.size} rank(s) ({method_label}, eta={eta_val}, eta_sos={eta_sos})"
     )
+    if freq_spec is not None:
+        parallel.print_root(f"  Analytic frequency integral: {freq_spec.describe()}")
 
     # Scatter k-points across MPI ranks
     my_indices, my_klist = parallel.scatter_work(k_list)
@@ -172,6 +206,7 @@ def compute_nonlinear_optical(system: System, cfg: dict) -> dict:
             system, tk, dim, dir_chars, directions,
             omega1list, omega2_val, omega2_mtx, eta_val, eta_mtx,
             eflist, kT, nef, nomega, eta_sos=eta_sos,
+            freq_integral=freq_spec,
         )
 
         # Projector override for chi_e1/chi_e2
@@ -207,7 +242,83 @@ def compute_nonlinear_optical(system: System, cfg: dict) -> dict:
             total += result[name][a][b][c]
         result['chi_total'][a][b][c] = total
 
+    if freq_spec is not None:
+        cond = parallel.reduce_max(freq_spec.max_cond)
+        parallel.print_root(
+            f"  Frequency integral: worst cancellation ratio {cond:.2e} "
+            f"(~{max(0.0, np.log10(max(cond, 1.0))):.1f} decimal digits lost "
+            f"to the near-coincident z12/z1 poles)"
+        )
+        if any(p <= 1 for p in freq_spec.p_list):
+            parallel.print_root(
+                "  Note: chi_e1 and chi_i1 are omega-independent, so their "
+                "integral to omega_max=inf does not converge for p <= 1 and "
+                "is returned as NaN. Both are unphysical and excluded from "
+                "chi_total."
+            )
+        result = _split_freq_integral(result, freq_spec)
+
     return result
+
+
+def _estimate_direct_gap(system, nk_cfg, ef, nk_max=16):
+    """Minimum direct gap straddling `ef`, on a coarse grid.
+
+    Only used to sanity-check omega_min against ``omega_min << E_gap``; a few
+    hundred diagonalizations, run on rank 0 and broadcast. Returns ``inf`` if
+    no k-point has states on both sides of `ef`.
+    """
+    if not parallel.is_root():
+        return parallel.bcast(None)
+
+    b1, b2, b3 = get_reciprocal_lattice(system.unitcell_vectors)
+    n1, n2, n3 = (max(1, min(n, nk_max)) for n in nk_cfg)
+    db1 = b1 / n1 if n1 > 1 else np.zeros(3)
+    db2 = b2 / n2 if n2 > 1 else np.zeros(3)
+    db3 = b3 / n3 if n3 > 1 else np.zeros(3)
+
+    gap = np.inf
+    for i1 in range(n1):
+        for i2 in range(n2):
+            for i3 in range(n3):
+                tk = (-b1 / 2 - b2 / 2 - b3 / 2
+                      + db1 * i1 + db2 * i2 + db3 * i3)
+                H, S = get_H_k(system, tk)
+                ek = diagonalize_hk(H, S, eigenvectors=False)
+                below = ek[ek <= ef]
+                above = ek[ek > ef]
+                if below.size and above.size:
+                    gap = min(gap, float(above.min() - below.max()))
+    return parallel.bcast(gap)
+
+
+def _split_freq_integral(result, spec):
+    """Split the channel axis into integral values plus endpoint diagnostics.
+
+    Every chi name keeps its ``[a][b][c]`` nesting, with the second array axis
+    reduced from `spec.nchan` channels to one column per requested power `p`.
+    The lower-endpoint coefficients (note section 5.2) are emitted as extra
+    top-level names, for the physical terms and their total only — those are
+    the ones whose divergences are supposed to cancel against each other.
+    """
+    jidx = spec.channel_indices('J')
+
+    def _remap(src, idx):
+        out = {}
+        for a, bd in src.items():
+            out[a] = {}
+            for b, cd in bd.items():
+                out[a][b] = {}
+                for c, arr in cd.items():
+                    out[a][b][c] = arr[:, idx]
+        return out
+
+    out = {name: _remap(dirs, jidx) for name, dirs in result.items()}
+    for suffix, kind, j in spec.diagnostic_names():
+        idx = spec.channel_indices(kind, j)
+        for name in CHI_PHYSICAL + ['chi_total']:
+            out[f'{suffix}_{name}'] = _remap(result[name], idx)
+    return out
 
 
 def _compute_A_W_k(system, k, dir_chars=None):
