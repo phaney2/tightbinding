@@ -15,6 +15,15 @@ from ..types import System
 from .. import parallel
 from .nonlinear_optical_fast import _process_kpoint_fast
 from .freq_integral import FreqIntegralSpec
+from .wannier_gauge import (
+    WANNIER_R_DEFAULT, compute_A_W_k, resolve_wannier_r, system_has_wannier_r,
+)
+
+# Back-compat alias: BUG_wannier_r_correction.md and scratch scripts import
+# `_compute_A_W_k` from this module.  The implementation moved to
+# calc/wannier_gauge.py so that every engine gates the same kernel through the
+# same switch; the 3-argument call form is unchanged.
+_compute_A_W_k = compute_A_W_k
 
 
 # 14 chi component names matching MATLAB
@@ -100,6 +109,10 @@ def compute_nonlinear_optical(system: System, cfg: dict) -> dict:
     method = calc.get('method', 'sos')  # 'sos' or 'projector'
     lam = float(calc.get('lam', 1e-4))  # finite-diff step for projector
 
+    # Wannier-gauge position correction: one switch, read from system.wannier_r
+    # by the shared reader that delta_Q and quantum_metric also use.
+    wannier_r = resolve_wannier_r(cfg, system, 'nonlinear_optical')
+
     # --- sampled vs frequency-integrated omega axis ---
     fi_block = calc.get('freq_integral')
     freq_spec = None
@@ -177,8 +190,17 @@ def compute_nonlinear_optical(system: System, cfg: dict) -> dict:
 
     method_label = f"method={method}" + (f", lam={lam:.0e}" if method == 'projector' else "")
     parallel.print_root(
-        f"  Nonlinear optical: {total_jobs} k-points on {parallel.size} rank(s) ({method_label}, eta={eta_val}, eta_sos={eta_sos})"
+        f"  Nonlinear optical: {total_jobs} k-points on {parallel.size} rank(s) "
+        f"({method_label}, eta={eta_val}, eta_sos={eta_sos}, "
+        f"wannier_r={wannier_r})"
     )
+    if method == 'projector' and wannier_r and system_has_wannier_r(system):
+        parallel.print_root(
+            "  NOTE: method='projector' rebuilds chi_e1/chi_e2 from H(k) "
+            "projectors, which carry no Wannier-gauge position correction. "
+            "Those two terms are effectively wannier_r=False regardless of the "
+            "flag (both are unphysical and excluded from chi_total)."
+        )
     if freq_spec is not None:
         parallel.print_root(f"  Analytic frequency integral: {freq_spec.describe()}")
 
@@ -206,7 +228,7 @@ def compute_nonlinear_optical(system: System, cfg: dict) -> dict:
             system, tk, dim, dir_chars, directions,
             omega1list, omega2_val, omega2_mtx, eta_val, eta_mtx,
             eflist, kT, nef, nomega, eta_sos=eta_sos,
-            freq_integral=freq_spec,
+            freq_integral=freq_spec, wannier_r=wannier_r,
         )
 
         # Projector override for chi_e1/chi_e2
@@ -321,93 +343,22 @@ def _split_freq_integral(result, spec):
     return out
 
 
-def _compute_A_W_k(system, k, dir_chars=None):
-    """Fourier-interpolate Wannier position operator and its k-derivative.
-
-    Implements Eq. 20 of Ibañez-Azpiroz et al. (arXiv:1804.04030):
-        A^(W)_{k,nm,a} = Σ_R exp(ik·(R+τ_m-τ_n)) <0n|r̂_a - τ_{m,a}|Rm>
-
-    Returns (A_W, dA_W) where:
-      A_W[d]       = A^(W)_d(k), shape (norbs, norbs)
-      dA_W[d1][d2] = ∂_{d2} A^(W)_{d1}(k), shape (norbs, norbs)
-
-    Returns (None, None) if system has no wannier_r_matrices.
-    """
-    if not hasattr(system, 'wannier_r_matrices'):
-        return None, None
-
-    lattice_vectors = system.unitcell_vectors   # (3, 3), rows = a1, a2, a3
-    r_matrices = system.wannier_r_matrices      # list of [r_x, r_y, r_z] per R
-    displacements = system.wannier_r_displacements  # list of R in lattice coords
-    norbs = system.norbs
-    ap = system.atompos
-    kx, ky, kz = k
-    ap_arr = [ap.x, ap.y, ap.z]
-
-    labels = ['x', 'y', 'z']
-    if dir_chars is None:
-        dir_chars = labels
-
-    # phase_ap[i,j] = exp(ik·(τ_j - τ_i))
-    phase_ap = np.exp(1j * (kx * ap.x + ky * ap.y + kz * ap.z))
-
-    # Find R=0 index
-    r0_idx = None
-    for idx, R_latt in enumerate(displacements):
-        if np.allclose(R_latt, 0):
-            r0_idx = idx
-            break
-
-    # Accumulate bare Bloch sums (without phase_ap)
-    bare_A = {d: np.zeros((norbs, norbs), dtype=complex) for d in labels}
-    bare_dA = {d1: {d2: np.zeros((norbs, norbs), dtype=complex)
-                    for d2 in labels} for d1 in labels}
-
-    for r_idx, R_latt in enumerate(displacements):
-        R_cart = R_latt @ lattice_vectors
-        scalar_phase = np.exp(1j * np.dot(k, R_cart))
-
-        for a_idx, a_label in enumerate(labels):
-            r_a = r_matrices[r_idx][a_idx]
-            # For R=0 diagonal: <0n|r̂_a - τ_{n,a}|0n> = 0 exactly.
-            # Zero the diagonal rather than subtracting centres, to avoid
-            # Berry-phase wrapping artifacts in Wannier90's position matrix.
-            if r_idx == r0_idx:
-                r_a = r_a.copy()
-                np.fill_diagonal(r_a, 0.0)
-
-            weighted = r_a * scalar_phase
-            bare_A[a_label] += weighted
-
-            for b_idx, b_label in enumerate(labels):
-                bare_dA[a_label][b_label] += 1j * R_cart[b_idx] * weighted
-
-    # Apply atompos phase:
-    #   A_W[a] = phase_ap * bare_A[a]
-    #   dA_W[a][b] = phase_ap * (bare_dA[a][b] + i * ap_b * bare_A[a])
-    A_W = {}
-    dA_W = {}
-    for a_label in labels:
-        A_W[a_label] = phase_ap * bare_A[a_label]
-        dA_W[a_label] = {}
-        for b_idx, b_label in enumerate(labels):
-            dA_W[a_label][b_label] = phase_ap * (
-                bare_dA[a_label][b_label] + 1j * ap_arr[b_idx] * bare_A[a_label]
-            )
-
-    return A_W, dA_W
-
-
 def _process_kpoint(
     system, k, dim, dir_chars, directions,
     omega1list, omega2_val, omega2_mtx, eta_val, eta_mtx,
     eflist, kT, nef, nomega, eta_sos=None,
+    wannier_r=WANNIER_R_DEFAULT,
 ):
     """Process a single k-point: diagonalize, build operators, compute chi contributions.
 
     Near-degeneracy handling uses Souza Lorentzian regularization
       inv_de = w_{nm} / (w_{nm}^2 + eta_sos^2)
     (bounded at w_{nm}->0).  If eta_sos is None, defaults to eta_val.
+
+    `wannier_r` gates the Wannier-gauge position correction (see
+    calc/wannier_gauge.py).  It is inert for systems without
+    ``wannier_r_matrices``.  This is the unvectorized reference path and must
+    track `_process_kpoint_fast`, which takes the same keyword.
     """
     if eta_sos is None:
         eta_sos = eta_val
@@ -473,7 +424,7 @@ def _process_kpoint(
             )
 
     # --- Wannier position operator corrections (arXiv:1804.04030) ---
-    A_W, dA_W = _compute_A_W_k(system, k, dir_chars)
+    A_W, dA_W = compute_A_W_k(system, k, dir_chars, enabled=wannier_r)
     if A_W is not None:
         # Rotate to Hamiltonian gauge: A^(H) = U† A^(W) U
         A_H = {}

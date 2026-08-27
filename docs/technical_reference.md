@@ -23,6 +23,7 @@ tightbinding/
 │   ├── nonlinear_optical.py # Second-order nonlinear optical response χ^(2)
 │   ├── nonlinear_optical_fast.py # Vectorized χ^(2) kernel (the one actually called)
 │   ├── freq_integral.py     # Closed-form ∫dω ω^(-p)(...) for integrated χ^(2)
+│   ├── wannier_gauge.py     # Wannier-gauge position correction: the switch + the kernel
 │   ├── quantum_metric.py    # Quantum metric tensor + linear response
 │   ├── delta_Q.py           # DC field-induced quantum geometric tensor change
 │   └── jdos.py              # Joint density of states
@@ -565,7 +566,9 @@ per-k-point work is done by `nonlinear_optical_fast._process_kpoint_fast`;
 3. Build velocity matrix in eigenbasis: `v_nm = ψ†·vtb·ψ`
 4. Build position operator: `r_nm = -i·v_nm / (E_n - E_m)` for n ≠ m
 5. Build generalized derivative `dk_r` via `_compute_dk_rmtx`
-6. Compute 14 chi components for each (ef, ω1) pair
+6. Apply the Wannier-gauge correction to both (Eqs. 22 and 36) when
+   `system.wannier_r` is on — see `calc/wannier_gauge.py`
+7. Compute 14 chi components for each (ef, ω1) pair
 
 **14 chi components:**
 `chi_ii`, `chi_ee1`, `chi_ee2`, `chi_ei1`, `chi_ei2`,
@@ -612,13 +615,17 @@ sampled ω list).
 
 ### `calc/nonlinear_optical_fast.py`
 
-#### `_process_kpoint_fast(..., freq_integral=None)`
+#### `_process_kpoint_fast(..., freq_integral=None, wannier_r=WANNIER_R_DEFAULT)`
 
 Vectorized per-k-point kernel. All arrays carry a trailing length-`W` axis.
 That axis is an **ω axis, not necessarily a list of photon energies**: every
 phase-3 contraction is linear in the ω-dependent kernels, so substituting
 integrated kernels for sampled ones turns the same code into the integrated
 engine. `freq_integral=None` gives the historical sampled behaviour.
+
+`wannier_r` gates the Wannier-gauge correction, but only in the Phase-1
+operator build: when the caller supplies `_k_data`, the operators are taken as
+given and the flag has no effect.
 
 #### `_build_omega_kernels(de_mtx, omega1list, omega2_val, eta_val, freq_integral)`
 
@@ -731,6 +738,52 @@ sampled-mode regression against a `git worktree` baseline passed as `argv[1]`).
 
 ---
 
+### `calc/wannier_gauge.py`
+
+The single switch and the single kernel for the Wannier-gauge position
+correction. Every engine that builds an `r` operator — `nonlinear_optical`,
+`nonlinear_optical_fast`, `delta_Q`, `quantum_metric` — goes through both, so
+they cannot drift apart. A new engine with a position operator must do the same.
+
+#### `compute_A_W_k(system, k, dir_chars=None, enabled=True, need_deriv=True)`
+
+Fourier-interpolates the Wannier position matrices (Eq. 20 of
+arXiv:1804.04030):
+
+```
+A^(W)_{k,nm,a} = Σ_R exp(ik·(R + τ_m - τ_n)) <0n|r̂_a - τ_{m,a}|Rm>
+```
+
+Returns `(A_W, dA_W)` with `A_W[d]` and `dA_W[d1][d2] = ∂_{d2} A^(W)_{d1}`, or
+`(None, None)` when `enabled=False` or the system has no `wannier_r_matrices`.
+Both cases returning `None` is what lets every call site keep a single
+`if A_W is not None:` guard with no separate branch for the flag.
+`need_deriv=False` skips `dA_W` for callers that only correct `r` itself.
+
+This function was `nonlinear_optical._compute_A_W_k` before the switch was
+unified; that name survives there as an alias.
+
+#### `resolve_wannier_r(cfg, system, engine) -> bool`
+
+Reads `cfg['system']['wannier_r']`, defaulting to `WANNIER_R_DEFAULT`. Raises
+on a non-boolean value and on the old `cfg['calc']['wannier_r']` location.
+Prints one notice per engine per run: *inert* when the system carries no
+position matrices, and a warning naming `BUG_wannier_r_correction.md` at
+**either** setting when it does — with that bug open, neither value gives a
+trustworthy answer on `_tb.dat` input.
+
+`WANNIER_R_DEFAULT` is currently `False`, which is *not* the physically correct
+value; it is the diagnostic setting, chosen while the correction is known
+defective. Flip it back to `True` when the bug closes.
+
+Also exports `system_has_wannier_r(system)`, `validate_wannier_r(cfg)` (called
+from `config.load_config` so YAML errors surface at load time),
+`warn_unused_wannier_r(cfg, calc_type)` (called from `main._dispatch` for
+engines with no position operator), `offdiag_A_H(A_W, psi, dir_chars)`, and
+`reset_notices()` for tests that drive many runs in one process.
+
+---
+
 ### `calc/quantum_metric.py`
 
 #### `compute_quantum_metric(system, cfg) -> dict`
@@ -745,13 +798,39 @@ sampled-mode regression against a `git worktree` baseline passed as `argv[1]`).
    ψ± = ψ ± ψ·pert
    ```
 5. Compute perturbed velocity matrices: `v±[d1][d3] = ψ±[d3]†·vtb[d1]·ψ±[d3]`
-6. Loop over Fermi energies:
-   - **Q[d1][d2]** = Σ_nm v[d1]_nm · conj(v[d2]_nm) · f_nm / ΔE²_nm
+6. Wannier-gauge connection `a^(H) = offdiag(ψ† A^(W) ψ)`, and the same rotated
+   by `ψ±` for the perturbed quantities — skipped when `system.wannier_r` is
+   off or the system carries no position matrices
+7. Loop over Fermi energies, everything through `_rr_sum`:
+   - **Q[d1][d2]** = Σ_nm r[d1]_nm · conj(r[d2]_nm) · f_nm
    - **dQ[d1][d2][d3]** = (Q+ - Q-) / (2δ)  — intrinsic, via numerical derivative
-   - **dQf[d1][d2][d3]** = Σ_nm v[d1]_nm · conj(v[d2]_nm) · df_nm[d3] / ΔE²_nm
+   - **dQf[d1][d2][d3]** = Σ_nm r[d1]_nm · conj(r[d2]_nm) · df_nm[d3]
      — extrinsic (Fermi surface)
 
-**Degeneracy handling:** Pairs with `|ΔE| < 1e-5` are masked out (zero contribution).
+#### `_rr_sum(v1, v2, a1, a2, inv_de, inv_de2, weight)`
+
+The one place the quadratic form is built, so Q, dQ and dQf cannot use
+different position operators. With `r = -i v/ω + a^(H)` it expands to
+
+```
+v1 conj(v2)/ω² + (-i v1/ω) conj(a2) + a1 conj(-i v2/ω) + a1 conj(a2)
+```
+
+deliberately *not* written as `r1 * conj(r2)`: keeping the leading term in the
+original factor order makes the `a = None` case reproduce the pre-correction
+engine bit for bit. That is not cosmetic — dQ is a finite difference of two
+nearly equal sums, so a 1-ulp reassociation is amplified by `|Q| / (δ|dQ|)`,
+a factor of ~1e8 wherever dQ is small.
+
+**Position operator:** `r = -i v/ω` plus the Wannier-gauge correction when
+`system.wannier_r` is on; see `calc/wannier_gauge.py`. Masking matches
+χ^(2)/`delta_Q`: the degeneracy mask applies to the `1/ω` factor only, and
+`a^(H)` — smooth across a degeneracy — is added unmasked.
+
+**Degeneracy handling:** Pairs with `|ΔE| < 1e-5` are masked out (zero
+contribution). Note this is a hard cutoff, unlike the Souza `eta_sos`
+regularization used by `nonlinear_optical.py` and `delta_Q.py` — an
+inconsistency that predates the shared position operator.
 
 ---
 
@@ -762,11 +841,12 @@ sampled-mode regression against a `git worktree` baseline passed as `argv[1]`).
 DC field-induced change in the quantum geometric tensor, δQ^{ab} for a static
 field along `c`. Implements Eq. 40 of `revised_formula_sheet_eta.pdf`.
 
-> ⚠️ Shares `_compute_A_W_k` with `nonlinear_optical.py`, which is currently
-> broken for Wannier input — see `BUG_wannier_r_correction.md`. TB_simple
-> systems are unaffected: `bloch.py` builds H(k) in the atomic gauge, where the
-> tight-binding position operator is exactly `r = -i v/ω` with no intra-cell
-> correction, so `_compute_A_W_k` correctly returns `None`.
+> ⚠️ Shares `compute_A_W_k` with `nonlinear_optical.py` and
+> `quantum_metric.py`, and that function is currently broken for Wannier input
+> — see `BUG_wannier_r_correction.md`. TB_simple systems are unaffected:
+> `bloch.py` builds H(k) in the atomic gauge, where the tight-binding position
+> operator is exactly `r = -i v/ω` with no intra-cell correction, so
+> `compute_A_W_k` correctly returns `None`.
 
 **Returns** `{'Q_tilde': {}, 'delta_Q': ..., 'delta_Q_terms': ...}` with
 `delta_Q[a][b][c] -> array(nef,)`. `Q_tilde` is always empty.

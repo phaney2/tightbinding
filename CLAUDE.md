@@ -2,18 +2,21 @@
 
 ## ⚠ OPEN BLOCKING BUG — read before running production calculations
 
-`_compute_A_W_k` (the Wannier-gauge position correction,
-`calc/nonlinear_optical.py:213-289`) is **broken**. It makes `delta_Q`
-complex when it must be real, and gives chi^(2) a non-vanishing
-dissipative part below the band gap that survives eta -> 0. Both engines
-share the one function, so **chi^(2) and delta_Q results from Wannier
-(`_tb.dat`) input are both affected** — including any chi^(2)-vs-delta_Q
-comparison, where it contaminates both sides at once.
+`compute_A_W_k` (the Wannier-gauge position correction, now
+`calc/wannier_gauge.py`) is **broken**. It makes `delta_Q` complex when it
+must be real, and gives chi^(2) a non-vanishing dissipative part below the
+band gap that survives eta -> 0. Three engines share the one function, so
+**chi^(2), delta_Q and quantum_metric results from Wannier (`_tb.dat`)
+input are all affected** — including any chi^(2)-vs-delta_Q comparison,
+where it contaminates both sides at once.
 
 Full diagnosis, the specific things to check, and the test criteria for a
 fix are in **`BUG_wannier_r_correction.md`**. Do not generate production
-data from Wannier input until this is resolved. Do not "fix" it by
-setting `wannier_r=False` — that is physically wrong, see the note there.
+data from Wannier input until this is resolved. Do not treat
+`system.wannier_r: false` as a fix — it is the current *default* precisely
+so the broken term is not silently folded into new results, but it drops a
+physically required term and is a diagnostic, not an answer. See the note
+there.
 
 ## Working Style: Docs First
 Read this file (and any PDF/notes the user points to) BEFORE opening source files.
@@ -48,6 +51,7 @@ tightbinding/
     nonlinear_optical.py  — chi^(2) nonlinear optical susceptibility
     nonlinear_optical_fast.py — vectorized chi^(2) path (must track nonlinear_optical.py)
     freq_integral.py      — closed-form int dw w^-p (...) for the frequency-integrated chi^(2)
+    wannier_gauge.py      — Wannier-gauge position correction: the one switch + the one kernel
     quantum_metric.py     — quantum metric tensor + linear response
     delta_Q.py            — DC field-induced change in quantum geometric tensor
   nrl/
@@ -327,7 +331,56 @@ Uses `_compute_dk_rmtx` (Sipe sum rule) borrowed from `nonlinear_optical.py`. Si
 
 **Gotchas for small-gap models.** `eta_sos` defaults to 0.05, which is comparable to (or larger than) the gap in low-energy models — set it to ~1e-8 whenever bands are never degenerate. Also set `eta: 0.0` to compare against unbroadened analytic results, and `kT` well below the gap.
 
-**Position operator gauge.** `bloch.py` builds H(k) in the *atomic gauge*, exp(ik·(R + tau_j - tau_i)) via `atompos`. In that gauge the TBA position operator is exactly r = -i*v/w with zero intra-cell Wannier correction, so `_compute_A_W_k` correctly returns None for TB_simple systems even in multi-atom cells. k·p expansions of `get_H_k` output should therefore be done in the atomic gauge too.
+**Position operator gauge.** `bloch.py` builds H(k) in the *atomic gauge*, exp(ik·(R + tau_j - tau_i)) via `atompos`. In that gauge the TBA position operator is exactly r = -i*v/w with zero intra-cell Wannier correction, so `compute_A_W_k` correctly returns None for TB_simple systems even in multi-atom cells (see "Wannier-Gauge Position Correction" below). k·p expansions of `get_H_k` output should therefore be done in the atomic gauge too.
+
+## Wannier-Gauge Position Correction (`system.wannier_r`)
+
+One switch, one kernel, in `calc/wannier_gauge.py`. Every engine that builds a position
+operator reads the flag through `resolve_wannier_r(cfg, system, engine)` and gates the
+kernel through `compute_A_W_k(system, k, dir_chars, enabled=...)`. **Add an engine with an
+`r` operator and it must go through both** — that is the whole point of the module.
+
+```yaml
+system:
+  wannier_tb: mos2_tb.dat
+  wannier_r: false        # <- here. NOT under calc:
+```
+
+| engine | uses it |
+|---|---|
+| `nonlinear_optical` (+ `_fast`) | Eq. 22 on `r`, Eq. 36 on `r^{a;b}` |
+| `delta_Q` | same, via the same kernel |
+| `quantum_metric` | Eq. 22 on `r`; Q, dQ and dQf all go through `_rr_sum` |
+| `bands`, `all_ek`, `jdos` | no position operator; `main._dispatch` notes the key is unused |
+
+**Default is `False` and that is deliberately wrong.** `WANNIER_R_DEFAULT` in
+`wannier_gauge.py` is the diagnostic setting, chosen so the defective correction is not
+silently folded into new results while `BUG_wannier_r_correction.md` is open. Restore it
+to `True` when that bug closes — the `TODO` is on the constant. On a system that actually
+carries `wannier_r_matrices` the engine warns at *both* settings, because neither is
+currently trustworthy.
+
+**No-op cases.** `build_system` models and `_hr.dat` input carry no position matrices, so
+the flag changes nothing there — the run banner says `(inert: ...)` rather than leaving it
+ambiguous. Only `_tb.dat` input (the TMD set) is affected.
+
+**Errors, not silent drops.** `calc.wannier_r` raises (it lived there, for `delta_Q` only,
+before the unification); a non-boolean value raises. `config.load_config` runs the same
+validator, so YAML mistakes fail at load.
+
+**Two known gaps, both documented rather than fixed:**
+- `calc.method: projector` rebuilds `chi_e1`/`chi_e2` from `H(k)` projectors, which carry
+  no correction — those two terms are effectively `wannier_r=False` regardless of the flag.
+  The engine prints a note. Both are unphysical and excluded from `chi_total`.
+- `_process_kpoint_fast(_k_data=...)` bypasses the Phase-1 operator build entirely, so the
+  flag has no effect on that path.
+
+**Regression status of the unification:** `input_qm_test.yaml`, `input_nonlinear_test.yaml`
+and `input_delta_Q_test.yaml` are **bit-identical** before and after. `quantum_metric`'s
+`_rr_sum` keeps the leading term in its original factor order specifically to achieve that;
+`dQ` amplifies a 1-ulp reassociation by `|Q|/(delta*|dQ|)` ~ 1e8 where `dQ` is small.
+Tests: `examples/test_wannier_r_flag.py` (31 checks, incl. a synthetic `_tb.dat`-like
+system so the correction is actually exercised on a machine with no Wannier files).
 
 ## MATLAB Source Reference
 The original MATLAB code (`master_response`) is the reference when porting and validating.

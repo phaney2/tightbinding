@@ -1,138 +1,124 @@
-# NOTE: `wannier_r` is not consistent across calculation engines
+# NOTE: `wannier_r` across calculation engines — RESOLVED
 
-**Status:** documented, not fixed. Requested 2026-08-27.
-**Related:** `BUG_wannier_r_correction.md` (open — the correction itself is
-believed defective). This note is about the *switch*, not the physics.
-
-**Design decisions (flag name, where it lives in the config, default value)
-are deliberately left open** — the requester will settle those when
-implementing.
+**Status:** fixed 2026-08-27. Requested the same day; this file is now the
+record of what was decided and why, not an open item.
+**Related:** `BUG_wannier_r_correction.md` (still open — the correction
+itself is defective). This note was always about the *switch*, not the
+physics.
 
 ---
 
-## 1. The actual state
+## 1. What was wrong
 
-Three engines use a position operator, and all three behave differently:
+Three engines used a position operator and all three behaved differently:
 
 | engine | position operator | Wannier correction | switch |
 |---|---|---|---|
-| `nonlinear_optical` (+ `_fast`) | Eq. 22 corrected `r` | **always applied** | **none — hard-wired ON** |
+| `nonlinear_optical` (+ `_fast`) | Eq. 22 corrected `r` | always applied | none — hard-wired ON |
 | `delta_Q` | Eq. 22 corrected `r` | applied by default | `calc.wannier_r`, default `True` |
-| `quantum_metric` | bare TBA `r = -i v / w` | **never applied** | **none — hard-wired OFF** |
+| `quantum_metric` | bare TBA `r = -i v / w` | never applied | none — hard-wired OFF |
 | `jdos`, `all_ek`, `bands` | none | n/a | n/a |
 
-> **Note on a common misremembering:** it is chi^(2) that *lacks* the flag and
-> `delta_Q` that *has* it, not the other way round. `grep -c 'wannier_r'`
-> gives 0 for `nonlinear_optical.py`, `nonlinear_optical_fast.py` and
-> `quantum_metric.py`, and 6 for `delta_Q.py`.
+Two consequences: chi^(2) could not be run with the suspect term removed
+while `delta_Q` could (backwards, for debugging a bug both share), and
+`Q` and its own DC response `dQ` sat on opposite sides of the correction.
 
-Two separate problems follow:
+## 2. What was done
 
-1. **You cannot turn the correction off in chi^(2) at all.** Since
-   `BUG_wannier_r_correction.md` is open and both engines share the defect
-   (`delta_Q` imports `_compute_A_W_k` from `nonlinear_optical` rather than
-   reimplementing it), there is currently no way to run the chi^(2) side of a
-   chi^(2)-vs-`delta_Q` comparison with the suspect term removed — while the
-   `delta_Q` side can be. That asymmetry is exactly backwards for debugging.
+**One switch, one kernel, in a new module `calc/wannier_gauge.py`.**
 
-2. **`quantum_metric` and `delta_Q` disagree with each other.** `Q` is
-   computed with the bare TBA position operator and `delta_Q` — its own DC
-   field response — with the corrected one. Whatever the right answer is, `Q`
-   and `dQ` should not be on opposite sides of it. `quantum_metric` is
-   effectively pinned at `wannier_r=False` with no way to say so.
+- `resolve_wannier_r(cfg, system, engine)` — the only reader of the flag.
+- `compute_A_W_k(system, k, dir_chars, enabled=..., need_deriv=...)` — the
+  only kernel, moved here from `nonlinear_optical.py` (which keeps
+  `_compute_A_W_k` as an alias). It returns `(None, None)` both when
+  disabled and when the system has no position matrices, so every call
+  site keeps its existing `if A_W is not None:` guard and needs no branch
+  for the flag.
+- `validate_wannier_r`, `warn_unused_wannier_r`, `system_has_wannier_r`,
+  `offdiag_A_H`, `reset_notices`.
 
----
+Any future engine with an `r` operator must go through those two
+functions. That is the durable part of the fix; the rest is plumbing.
 
-## 2. Where the gating would go
+### Design decisions (the three the original note left open)
 
-### `delta_Q.py` — the existing pattern to copy
+**Flag location: `system.wannier_r`.** It describes the gauge of the
+system's position operator, not the calculation, and the position
+matrices it acts on arrive with `wannier_tb`. `calc.wannier_r` now
+**raises** with a message saying where it went — a hard error rather than
+a silent ignore or a soft alias, since silently dropping a stale key is
+exactly the failure this whole exercise was about. A non-boolean value
+raises too. `config.load_config` runs the same validator, so YAML
+mistakes fail at load rather than mid-sweep.
 
-```
-107    wannier_r = bool(calc.get('wannier_r', True))     # read from config
-142    ...printed in the run banner...
-212    wannier_r=wannier_r,                              # passed to _process_kpoint
-246    def _process_kpoint(..., wannier_r=True, ...)     # signature
-329-332  if wannier_r: A_W, dA_W = _compute_A_W_k(...)   # else A_W, dA_W = None, None
-334    if A_W is not None:                               # the apply block
-```
+**Default: `False`, temporarily.** `WANNIER_R_DEFAULT` in
+`wannier_gauge.py` carries a `TODO` tying it to
+`BUG_wannier_r_correction.md`. `True` is the physically correct value and
+must be restored when that bug closes; `False` is the diagnostic setting,
+chosen so new results do not silently inherit the defect. **This changes
+chi^(2) and `delta_Q` results on `_tb.dat` input** for anyone re-running
+without setting the flag. TB_simple models are unaffected bitwise.
+On a system that actually carries `wannier_r_matrices` the engines warn
+at *both* settings, because with the bug open neither is trustworthy.
 
-The `if A_W is not None:` guard already exists in every engine (it is how a
-non-Wannier system is handled — see §4), so gating is only a matter of forcing
-`A_W = None` earlier. No changes are needed inside the apply blocks.
+**`quantum_metric`: the correction was implemented, not refused.** `Q`,
+`dQ` and `dQf` are all quadratic forms in `r`, now built through a single
+`_rr_sum` helper so they cannot use different position operators. The
+perturbed connection for the finite-difference `dQ` is `A^(W)` rotated by
+the perturbed states, `psip† A^(W) psip`; `pert` is anti-Hermitian, so
+`psip` is unitary to first order and that rotation is legitimate. Only
+the states are perturbed — `1/de` stays unperturbed, matching the
+pre-existing scheme. Masking follows chi^(2)/`delta_Q`: the degeneracy
+mask applies to the `1/w` factor only, and `a^(H)`, smooth across a
+degeneracy, is added unmasked.
 
-### `nonlinear_optical_fast.py` — the path that actually executes
+`_rr_sum` is written expanded rather than as `r1 * conj(r2)`, keeping the
+leading term in its original factor order. That is not fussiness: `dQ` is
+a finite difference of two nearly equal sums, so a 1-ulp reassociation is
+amplified by `|Q| / (delta |dQ|)` — about 1e8 wherever `dQ` is small. The
+expanded form makes the correction-off path bit-exact.
 
-```
-119    def _process_kpoint_fast(...)      # needs a new keyword
-184    from .nonlinear_optical import _compute_dk_rmtx, _compute_A_W_k
-197    A_W, dA_W = _compute_A_W_k(system, k, dir_chars)     # <-- gate here
-198    if A_W is not None:
-```
+## 3. Known gaps, documented rather than fixed
 
-Threading required: `compute_nonlinear_optical` reads `calc` and calls
-`_process_kpoint_fast` — the flag has to be read alongside `eta_sos` and
-passed down the same way. Note `_process_kpoint_fast` is also called directly
-by `examples/test_freq_integral.py` and by scratch scripts, so give the new
-keyword a default rather than making it positional.
+- **`calc.method: projector`** rebuilds `chi_e1`/`chi_e2` from `H(k)`
+  projectors, which carry no Wannier correction, so those two terms are
+  effectively `wannier_r=False` whatever the flag says. The engine prints
+  a note. Both are unphysical and excluded from `chi_total`.
+- **`_process_kpoint_fast(_k_data=...)`** skips the Phase-1 operator
+  build entirely, so the flag has no effect on that path. Documented in
+  the docstring.
+- **`quantum_metric` still uses a hard `DEG_THR = 1e-5` cutoff** where
+  chi^(2) and `delta_Q` use Souza `eta_sos` regularization. Unrelated to
+  this change and left alone.
 
-### `nonlinear_optical.py` — the slow/reference path
+## 4. Verification
 
-```
-401    def _process_kpoint(...)           # same treatment
-476    A_W, dA_W = _compute_A_W_k(system, k, dir_chars)     # <-- gate here
-477    if A_W is not None:
-```
+`examples/test_wannier_r_flag.py`, 31 checks. Because no `_tb.dat` file
+exists on this machine, the test decorates the gapped honeycomb with
+synthetic `wannier_r_matrices` built with `r(-R) = r(R)^dagger`, so
+`A^(W)(k)` is Hermitian as a real `_tb.dat` gives and the correction
+actually bites. It checks, for chi^(2) fast, chi^(2) reference, `delta_Q`
+and `quantum_metric`: off == undecorated (bitwise); on != off; slow ==
+fast at *both* settings; the keyword default is `WANNIER_R_DEFAULT`;
+`system.wannier_r` reaches each engine from the config; `calc.wannier_r`
+raises; the flag is inert bitwise on a system with no position matrices;
+and `Q`/`dQ`/`dQf` with the correction off reproduce the pre-refactor
+algebra (bitwise, checked inline — the example config
+`input_qm_test.yaml` gives machine-zero `dQ` and would not have exercised
+the finite-difference path at all).
 
-Easy to miss because it is dead code in normal runs (`_process_kpoint_fast`
-supersedes it), but it is the reference implementation and will silently
-disagree with the fast path if only one is gated.
+Regressions, all passing and unchanged: `test_freq_integral.py` including
+its `git worktree` baseline comparison at HEAD, `test_delta_Q_projector.py`,
+`honeycomb_warp/check_eq13.py`. The three benchmark configs
+(`input_qm_test`, `input_nonlinear_test`, `input_delta_Q_test`) are
+**bit-identical** before and after.
 
-### `quantum_metric.py` — nothing to gate yet
+## 5. What is *not* affected
 
-`_process_kpoint` (line 142) builds the metric directly from
-`vmtx * conj(vmtx) * inv_de2` (lines ~229-249) and never imports
-`_compute_A_W_k`. Making the flag *consistent* here means either
-(a) accepting a documented `wannier_r=False`-only engine and rejecting
-`wannier_r: true` in its config with a clear error, or
-(b) adding the correction so `Q` and `dQ` agree. (b) is the larger job and is
-a physics decision, not a plumbing one.
-
----
-
-## 3. Interaction with the open bug
-
-`BUG_wannier_r_correction.md` warns: *"Do not just set `wannier_r=False`"* —
-the Wannier gauge genuinely matters, and `False` is not the correct answer,
-only a diagnostic. That advice should survive into whatever the unified flag
-becomes: it is a debugging switch, not a physics preference. Consider making
-the non-default setting noisy (a warning naming the bug note) rather than
-silent.
-
-A single shared reader would also stop the three engines drifting apart again;
-right now the only thing tying them together is that they all call the same
-`_compute_A_W_k`.
-
----
-
-## 4. What is *not* affected
-
-`_compute_A_W_k` returns `(None, None)` when the system has no
-`wannier_r_matrices` attribute (`nonlinear_optical.py:324`, the
-`hasattr` guard). That attribute is only set on systems built from Wannier90
-input (`wannier_tb` / `wannier_hr` with centres).
-
-**For a model built with `build_system` + `fill_hamiltonian` the correction is
-a no-op regardless of the flag**, so the whole issue is invisible to the pure
-tight-binding toy models. Verified for the gapped honeycomb used in
-`examples/honeycomb_warp` and in `C:\Users\phaney\wrk\dQ\rerun_2026-08\honeycomb`:
-
-```python
-s, _ = build_honeycomb()
-hasattr(s, 'wannier_r_matrices')            # False
-_compute_A_W_k(s, k, ['x', 'y'])            # (None, None)
-```
-
-So the chi^(2) / `delta_Q` results in that directory — including the
-`int dw (1/w) Re chi_yyy = pi * dQ^yyy` sum rule verified there to 7e-6 — are
-untouched by this and by the open bug. The issue bites only Wannier90-derived
-systems, i.e. the TMD set.
+For a model built with `build_system` + `fill_hamiltonian`, or from
+`_hr.dat`, there are no `wannier_r_matrices` and the correction is a no-op
+regardless of the flag — the run banner now says so explicitly instead of
+leaving it ambiguous. The chi^(2) / `delta_Q` results in the honeycomb
+directories, including the `int dw (1/w) Re chi_yyy = pi * dQ^yyy` sum
+rule verified there to 7e-6, are untouched by this and by the open bug.
+The issue bites only Wannier `_tb.dat`-derived systems, i.e. the TMD set.

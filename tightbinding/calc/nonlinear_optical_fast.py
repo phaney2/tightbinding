@@ -16,6 +16,8 @@ turns the same code into the frequency-integrated engine.  See
 
 import numpy as np
 
+from .wannier_gauge import WANNIER_R_DEFAULT, compute_A_W_k
+
 
 def _build_omega_kernels(de_mtx, omega1list, omega2_val, eta_val,
                          freq_integral=None):
@@ -126,6 +128,8 @@ def _process_kpoint_fast(
     eta_sos=None,
     # FreqIntegralSpec: switches the omega axis from sampled to integrated.
     freq_integral=None,
+    # Wannier-gauge position correction; see calc/wannier_gauge.py.
+    wannier_r=WANNIER_R_DEFAULT,
 ):
     """Vectorized _process_kpoint: broadcasts over all ef and omega at once.
 
@@ -139,6 +143,12 @@ def _process_kpoint_fast(
     (analytic frequency integrals plus lower-endpoint coefficients) instead of
     photon energies.  Phase 3 is unchanged either way: it is linear in the
     omega-dependent kernels built by `_build_omega_kernels`.
+
+    `wannier_r` gates the Wannier-gauge position correction (see
+    calc/wannier_gauge.py); it is inert for systems without
+    ``wannier_r_matrices``.  Note it applies only to the Phase-1 build: when
+    `_k_data` is supplied the operators are taken as given and the flag has no
+    effect, since whoever built that cache already decided the question.
     """
     from ..bloch import get_H_v, diagonalize_hk
 
@@ -181,7 +191,7 @@ def _process_kpoint_fast(
             Delta[d] = vd[:, None] - vd[None, :]
             rmtx[d] = -1j * vmtx[d] * inv_de
 
-        from . nonlinear_optical import _compute_dk_rmtx, _compute_A_W_k
+        from . nonlinear_optical import _compute_dk_rmtx
         dk_rmtx = {}
         dk_rmtx_terms = {}
         for d1 in dir_chars:
@@ -194,7 +204,7 @@ def _process_kpoint_fast(
                     return_terms=True)
 
         # --- Wannier position operator corrections (arXiv:1804.04030) ---
-        A_W, dA_W = _compute_A_W_k(system, k, dir_chars)
+        A_W, dA_W = compute_A_W_k(system, k, dir_chars, enabled=wannier_r)
         if A_W is not None:
             A_H = {}
             for d in dir_chars:

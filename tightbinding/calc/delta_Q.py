@@ -22,6 +22,11 @@ Config keys (under cfg['calc']):
   nk, eflist, kT:  standard grid/Fermi parameters
   eta:             adiabatic broadening η (default 0.0)
 
+Config keys read from cfg['system']:
+  wannier_r:       Wannier-gauge position correction; see calc/wannier_gauge.py
+                   (this key used to live under cfg['calc'] — it moved so that
+                   chi^(2), delta_Q and quantum_metric share one switch)
+
 Notation:
   w_{nm} = E_n - E_m
   r^a_{nm} = -i v^a_{nm} / w_{nm}  (interband position, n != m)
@@ -36,7 +41,9 @@ import numpy as np
 from ..bloch import get_H_v, get_reciprocal_lattice, diagonalize_hk
 from ..types import System
 from .. import parallel
-from .nonlinear_optical import _compute_A_W_k
+from .wannier_gauge import (
+    WANNIER_R_DEFAULT, compute_A_W_k, resolve_wannier_r,
+)
 
 
 DEG_THR_DEFAULT = 1e-5
@@ -102,9 +109,10 @@ def compute_delta_Q(system: System, cfg: dict) -> dict:
     nef = len(eflist)
 
     # Whether to include the Wannier-gauge position-operator correction
-    # (Eq. 22 + 36 of arXiv:1804.04030).  Default True; set False only
-    # for diagnostic comparison against the bare TBA form.
-    wannier_r = bool(calc.get('wannier_r', True))
+    # (Eq. 22 + 36 of arXiv:1804.04030).  Read from system.wannier_r by the
+    # shared reader that chi^(2) and quantum_metric also use, so the three
+    # engines cannot drift apart again.
+    wannier_r = resolve_wannier_r(cfg, system, 'delta_Q')
 
     # Whether to compute the DC response of the occupied-subspace QGT
     # Q_occ^{ab} = Tr[P_occ (∂_a P_occ)(∂_b P_occ)], as derived in
@@ -245,7 +253,7 @@ def compute_delta_Q(system: System, cfg: dict) -> dict:
 
 def _process_kpoint(system, k, dir_chars, ab_pairs, field_dirs,
                     eflist, kT, nef, eta, eta_sos=ETA_SOS_DEFAULT,
-                    deg_thr=None, wannier_r=True,
+                    deg_thr=None, wannier_r=WANNIER_R_DEFAULT,
                     dQ_occupied_subspace=True):
     """Process a single k-point: diagonalize, build operators, assemble dQ.
 
@@ -255,7 +263,7 @@ def _process_kpoint(system, k, dir_chars, ab_pairs, field_dirs,
     |w_{nm}| >> eta_sos.  The `deg_thr` argument is retained for
     backward compatibility but ignored.
 
-    When ``wannier_r`` is True (default) and the system carries
+    When ``wannier_r`` is True and the system carries
     ``wannier_r_matrices``, the interband position operator ``rmtx`` and
     its generalized derivative ``dk_rmtx`` are augmented by the Wannier-
     gauge corrections (Eqs. 22 and 36 of arXiv:1804.04030).  The Eq. 36
@@ -326,10 +334,7 @@ def _process_kpoint(system, k, dir_chars, ab_pairs, field_dirs,
     # r = -i v/w (TBA form) is corrected by the off-diagonal Berry
     # connection a^(H)_{nm} = A^(H)_{nm} (Eq. 22), and the bare Sipe
     # dk_rmtx acquires a three-part correction (Eq. 36).
-    if wannier_r:
-        A_W, dA_W = _compute_A_W_k(system, k, dir_chars)
-    else:
-        A_W, dA_W = None, None
+    A_W, dA_W = compute_A_W_k(system, k, dir_chars, enabled=wannier_r)
 
     if A_W is not None:
         # Rotate Wannier-gauge connection into the Hamiltonian gauge.

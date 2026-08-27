@@ -84,6 +84,12 @@ def main(config_path: str) -> dict:
 def _dispatch(system, cfg, calc_type):
     """Dispatch to the appropriate calculation engine."""
 
+    if calc_type in ('band_structure', 'all_ek', 'jdos', 'kubo'):
+        # These build no position operator, so system.wannier_r has nothing to
+        # act on.  Say so rather than dropping the key silently.
+        from .calc.wannier_gauge import warn_unused_wannier_r
+        warn_unused_wannier_r(cfg, calc_type)
+
     if calc_type == 'band_structure':
         from .calc.bands import compute_band_structure, plot_bands
 

@@ -3,24 +3,35 @@
 **Status:** open, blocking. Found 2026-08-25 while validating the
 chi^(2) <-> static-field quantum-geometry relation on MoS2.
 
-**Location:** `tightbinding/calc/nonlinear_optical.py:213-289`
-(`_compute_A_W_k`), added in commit `1054879` ("Add Wannier-gauge
-r-correction and occupied-subspace dQ formulation").
+**Location:** `tightbinding/calc/wannier_gauge.py` (`compute_A_W_k`),
+added in commit `1054879` ("Add Wannier-gauge r-correction and
+occupied-subspace dQ formulation") as
+`nonlinear_optical._compute_A_W_k`, and moved to its own module when the
+`wannier_r` switch was unified. `nonlinear_optical._compute_A_W_k` is
+still an alias, so existing scripts and the snippets below keep working.
 
-**Blast radius:** one function, three call sites, two engines.
+**Blast radius:** one function, four call sites, three engines.
 
-| file | line | note |
-|---|---|---|
-| `calc/nonlinear_optical.py` | 213 | definition |
-| `calc/nonlinear_optical.py` | 365 | slow/reference chi^(2) path |
-| `calc/nonlinear_optical_fast.py` | 71, 84 | vectorized chi^(2) path — **this is the one that actually executes** |
-| `calc/delta_Q.py` | 39, 330 | imports from `nonlinear_optical`, calls per k-point |
+| file | note |
+|---|---|
+| `calc/wannier_gauge.py` | definition (`compute_A_W_k`) |
+| `calc/nonlinear_optical.py` | slow/reference chi^(2) path |
+| `calc/nonlinear_optical_fast.py` | vectorized chi^(2) path — **this is the one that actually executes** |
+| `calc/delta_Q.py` | per k-point |
+| `calc/quantum_metric.py` | per k-point, Eq. 22 only (no `dA_W`) |
 
 It surfaces as `chi_ei1/2_sipe_wannier_corr` in chi^(2) and as
-`T_Sipe_wannier_corr` in delta_Q. Because `delta_Q.py` imports the
-function rather than reimplementing it, **both engines carry the same
-defect**, and both sides of any chi^(2)-vs-delta_Q comparison are
-contaminated simultaneously.
+`T_Sipe_wannier_corr` in delta_Q. Because every engine calls the one
+definition, **all three carry the same defect**, and both sides of any
+chi^(2)-vs-delta_Q comparison are contaminated simultaneously.
+
+**Since 2026-08-27 the default is `system.wannier_r: false`** — the
+correction is off unless asked for, so new results do not silently
+inherit the defect. That is a holding position, not a fix: `false` drops
+a physically required term (see "Why the obvious quick fixes are wrong").
+Restore `WANNIER_R_DEFAULT = True` in `calc/wannier_gauge.py` when this
+bug closes. Reproducing any of the numbers below now requires
+`system.wannier_r: true` explicitly.
 
 ---
 
@@ -88,7 +99,7 @@ is real rather than an artefact of the diagnostic.
 
 ### Why the obvious quick fixes are wrong
 
-- **Do not just set `wannier_r=False`.** The Wannier gauge genuinely
+- **Do not treat `wannier_r=False` as the fix.** The Wannier gauge genuinely
   needs this correction — a `_tb.dat` Hamiltonian is not in the atomic
   gauge where `r = -i v/w` holds with zero intra-cell term (see the
   "Position operator gauge" note in `CLAUDE.md`, which applies to
@@ -116,7 +127,7 @@ eta. Those terms are clean.
 
 ## What needs to be fixed
 
-Review `_compute_A_W_k` (`nonlinear_optical.py:213-289`) against
+Review `compute_A_W_k` (`calc/wannier_gauge.py`) against
 arXiv:1804.04030 Eq. 22 + Eq. 36. The output is used as a Wannier-gauge
 correction to `dk_rmtx = r^{b;c}`, so an error in its phase, Hermiticity,
 or the sign/placement of the intra-cell displacement will propagate into
@@ -129,7 +140,7 @@ Specific things to check:
    non-Hermitian `A_W` is the most direct way to get a real observable
    coming out complex.
 2. **Phase convention of the Bloch sum.** `bloch.py` builds `H(k)` in the
-   *atomic* gauge, `exp(ik.(R + tau_j - tau_i))`. If `_compute_A_W_k`
+   *atomic* gauge, `exp(ik.(R + tau_j - tau_i))`. If `compute_A_W_k`
    builds its sum in the lattice/periodic gauge `exp(ik.R)`, the two are
    inconsistent and the correction is applied in the wrong gauge. Check
    which convention `wannier_r_displacements` is expressed in and whether
@@ -140,10 +151,14 @@ Specific things to check:
    `_compute_dk_rmtx`, and whether the same sign is correct for both
    `chi_ei1` and `chi_ei2` orderings.
 
-Fix in `nonlinear_optical.py` only — `delta_Q.py` and
-`nonlinear_optical_fast.py` both import the single definition, so the fix
-propagates. But note the *fast* path is what executes in practice; verify
-against it.
+Fix in `calc/wannier_gauge.py` only — `nonlinear_optical.py`,
+`nonlinear_optical_fast.py`, `delta_Q.py` and `quantum_metric.py` all
+import the single definition, so the fix propagates. But note the *fast*
+path is what executes in practice; verify against it.
+
+When the fix lands, flip `WANNIER_R_DEFAULT` back to `True` in that same
+file and re-run `examples/test_wannier_r_flag.py` (its default-value
+checks read the constant, so they follow automatically).
 
 ---
 
@@ -157,12 +172,15 @@ Cheapest and least ambiguous: one number, unambiguous correct answer,
 ~20 s at nk=200 on 16 ranks.
 
 ```python
-cfg = {'system': {}, 'calc': {
+cfg = {'system': {'wannier_r': True}, 'calc': {
     'type': 'delta_Q', 'nk': [200, 200], 'eflist': [-0.030102],
     'kT': 0.025, 'eta': 0.025, 'eta_sos': 0.025,
     'components': ['xx', 'xy', 'yx', 'yy'], 'field_direction': ['x', 'y'],
-    'dQ_occupied_subspace': True, 'wannier_r': True}}
+    'dQ_occupied_subspace': True}}
 ```
+
+(`wannier_r` under `calc` now raises — it moved to `system` when the
+switch was unified across engines.)
 
 **PASS:** `Im(dQ_yyy) / |Re(dQ_yyy)| < 1e-10` with `wannier_r=True`.
 Currently 0.374.

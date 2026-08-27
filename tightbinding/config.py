@@ -50,6 +50,11 @@ def _validate(cfg: dict) -> None:
     if 'type' not in cfg['calc']:
         raise ValueError("Missing calc.type")
 
+    # Placement/type of the Wannier-gauge switch, checked here so a typo or a
+    # stale calc.wannier_r fails at load rather than mid-sweep.
+    from .calc.wannier_gauge import validate_wannier_r
+    validate_wannier_r(cfg)
+
 
 def _convert_arrays(cfg: dict) -> None:
     """Convert list-of-lists to numpy arrays where appropriate."""

@@ -232,6 +232,40 @@ The `_tb.dat` format is produced by Wannier90 with `write_tb = .true.` in the `.
 - When using `wannier_tb`, the `lattice_vectors` key is optional — if omitted, the lattice vectors are read from the file. If provided, the config value is ignored and the file's lattice vectors are used.
 - The `wannier_centres` option provides Wannier function centre positions for building the intra-cell displacement matrices needed by velocity operators. Without it, all Wannier functions are treated as located at the origin.
 
+#### `wannier_r` — the Wannier-gauge position correction
+
+```yaml
+system:
+  wannier_tb: path/to/MoS2_tb.dat
+  wannier_r: false        # default; see below
+```
+
+A `_tb.dat` Hamiltonian is **not** in the atomic gauge, so the tight-binding
+form `r = -i v/ω` is incomplete — the intra-cell part of the position operator
+has to be added back from the position matrices the file carries. `wannier_r`
+switches that correction on and off for every engine that builds an `r`
+operator: `nonlinear_optical`, `delta_Q` and `quantum_metric`. One key, one
+meaning, all three engines.
+
+> ⚠️ **The default is `false`, and that is not the physically correct value.**
+> The correction is genuinely required for Wannier input, but the function that
+> computes it is currently defective — see `BUG_wannier_r_correction.md`. Until
+> that is fixed neither setting gives a trustworthy answer on `_tb.dat` input,
+> which is why the code warns at *both* settings. `false` is the diagnostic
+> value, chosen so the broken term is not silently folded into new results;
+> it is not a fix. The default returns to `true` when the bug closes.
+
+The flag is a **no-op** for models built from YAML (`lattice_type`/`positions`)
+and for `_hr.dat` input, neither of which carries position matrices: `bloch.py`
+builds those Hamiltonians in the atomic gauge, where `r = -i v/ω` is exact. The
+code says so in the run banner rather than leaving you guessing.
+
+Two errors worth knowing about:
+- `calc.wannier_r` is rejected — the key used to live there (for `delta_Q`
+  only) and moved to `system:` when the switch was unified. Move it.
+- The value must be a YAML boolean; `wannier_r: "true"` is rejected rather
+  than silently read as truthy.
+
 ---
 
 ## Calculation Engines
@@ -452,11 +486,22 @@ calc:
   outputfile: results/qm      # saves to results/qm.npz
 ```
 
+All three quantities are quadratic forms in the interband position operator, so
+they respect [`system.wannier_r`](#wannier_r--the-wannier-gauge-position-correction)
+exactly as `delta_Q` does. Before that switch was unified this engine was
+pinned at the uncorrected form while its own DC response `delta_Q` used the
+corrected one, which put Q and dQ on opposite sides of the correction.
+
 **Output:**
 - `.npz` file with Q, dQ, dQf tensors
 - Q[d1][d2] → complex array of shape `(nef,)` — metric tensor
 - dQ[d1][d2][d3] → complex array of shape `(nef,)` — intrinsic response
 - dQf[d1][d2][d3] → complex array of shape `(nef,)` — extrinsic (Fermi surface) response
+
+> Note on `dQ` conditioning: the intrinsic response is a finite difference of
+> two nearly equal sums, `(Q₊ - Q₋)/2δ`, so it loses roughly
+> `log10(|Q| / (δ|dQ|))` digits — around 8 wherever `dQ` happens to be small.
+> Values of `dQ` that come out near machine zero are noise, not physics.
 
 **Reloading:**
 
@@ -474,9 +519,10 @@ static electric field along direction `c`, with adiabatic iη broadening.
 
 > ⚠️ **Read the blocking-bug notice in `CLAUDE.md` before running this on
 > Wannier (`_tb.dat`) input.** `delta_Q` shares the Wannier-gauge position
-> correction with χ^(2), and that function is currently broken — it makes
-> `delta_Q` complex when it must be real. Systems built from YAML (TB_simple)
-> are unaffected, because the atomic gauge needs no such correction.
+> correction with χ^(2) and `quantum_metric`, and that function is currently
+> broken — it makes `delta_Q` complex when it must be real. Systems built from
+> YAML (TB_simple) are unaffected, because the atomic gauge needs no such
+> correction.
 
 ```yaml
 calc:
@@ -492,11 +538,12 @@ calc:
   outputfile: results/dQ
 ```
 
-Additional switches, both defaulting to `true`:
+The Wannier-gauge position correction is controlled by `system.wannier_r`, not
+by anything in `calc:` — see [`wannier_r`](#wannier_r--the-wannier-gauge-position-correction).
+A stale `calc.wannier_r` is an error, not a silently ignored key.
 
-- `wannier_r` — apply the Wannier-gauge position correction when the system
-  carries one. Set `false` only for diagnostic comparison against the bare
-  tight-binding form; it is *not* a fix for the bug above.
+One additional switch, defaulting to `true`:
+
 - `dQ_occupied_subspace` — respond the occupied-subspace tensor
   `Q_occ = Tr[P_occ ∂ₐP_occ ∂_b P_occ]`, restricting the outer band sum to
   occupied→unoccupied pairs. Setting `false` reverts to the band-resolved
