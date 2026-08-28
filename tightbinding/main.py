@@ -228,7 +228,10 @@ def _save_delta_Q(result, cfg):
     """Save delta Q results + config to .npz."""
     output_file = cfg.get('calc', {}).get('outputfile')
     flat = {}
-    for qty_name in ('Q_tilde', 'delta_Q'):
+    qty_names = ['Q_tilde', 'delta_Q']
+    if 'delta_Q_tau' in result:
+        qty_names.append('delta_Q_tau')
+    for qty_name in qty_names:
         qty = result[qty_name]
         for d1, v1 in qty.items():
             for d2, v2 in v1.items():
@@ -252,7 +255,9 @@ def load_delta_Q(path):
     """Load delta Q results from .npz.
 
     Returns (result_dict, config_dict).
-    result_dict has keys 'Q_tilde', 'delta_Q'.
+    result_dict has keys 'Q_tilde', 'delta_Q', and 'delta_Q_tau' when
+    the RTA transport piece was computed (thermal formulation; the
+    values are per unit relaxation time).
     """
     data, cfg = _load_npz(path)
     result = {'Q_tilde': {}, 'delta_Q': {}}
@@ -263,10 +268,12 @@ def load_delta_Q(path):
         qty_name = parts[0]
         if len(parts) == 3:
             _, d1, d2 = parts
+            result.setdefault(qty_name, {})
             result[qty_name].setdefault(d1, {})
             result[qty_name][d1][d2] = data[key]
         elif len(parts) == 4:
             _, d1, d2, d3 = parts
+            result.setdefault(qty_name, {})
             result[qty_name].setdefault(d1, {})
             result[qty_name][d1].setdefault(d2, {})
             result[qty_name][d1][d2][d3] = data[key]

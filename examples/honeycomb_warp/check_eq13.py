@@ -69,7 +69,7 @@ def note_dQ(k, a, b, c):
 
 
 def code_dQ(k, a, b, c):
-    res, _ = _process_kpoint(
+    res, _, _tau = _process_kpoint(
         system, k, ['x', 'y'], [a + b], [c],
         eflist=np.array([0.0]), kT=M / 50.0, nef=1, eta=0.0,
         eta_sos=1e-8, wannier_r=True, dQ_occupied_subspace=True,

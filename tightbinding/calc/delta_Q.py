@@ -20,7 +20,38 @@ Config keys (under cfg['calc']):
   field_direction: DC field direction c, e.g. 'x' or ['x', 'z']
   directions:      list of direction chars, only needed when components='all'
   nk, eflist, kT:  standard grid/Fermi parameters
-  eta:             adiabatic broadening η (default 0.0)
+  eta:             adiabatic broadening η (default 0.0; band/subspace paths only)
+  formulation:     'thermal' (default) | 'subspace' | 'band'
+
+Formulations:
+  thermal   δQ^{ab}_T of the thermal density matrix ρ = f(H), valid for
+            metals at finite temperature (delta_Q_metal_finite_T.pdf,
+            Eq. eq:final).  Sharp occ/un masks are replaced by smooth
+            weights W_pq = f_p f_pq², F_pq = f_pq/ω_pq; a new 'T_loop'
+            triple sum appears (vanishes for T=0 insulators); the
+            insulator 'dipole' and 'mix' three-band terms merge into a
+            single T_3band.  All f' (Fermi-surface) terms cancel
+            identically, so no ∂f/∂E enters the intrinsic result.
+            The adiabatic iη is not used here — finite kT is the
+            regulator.  The additive τ-linear RTA piece (Eq. eq:dQtau)
+            is always computed too — it is O(N²), i.e. free next to the
+            O(N³) intrinsic assembly — and reported separately as
+            'delta_Q_tau', **per unit τ** (multiply by your relaxation
+            time; extrinsic, diverges in the clean limit, never summed
+            into delta_Q).  In insulators it is exponentially zero.
+            A 'tau' config key is rejected so nobody expects the output
+            to already contain a τ factor.
+  subspace  T=0 occupied-projector formulation (delta_Q_occ_derivation),
+            with the approximate finite-T Pauli mask f_p(1-f_q).
+  band      band-resolved Σ_n f_n δQ_n (Eq. 40 of
+            revised_formula_sheet_eta.pdf).
+  Legacy key dQ_occupied_subspace: true/false maps to
+  'subspace'/'band'; giving both keys is an error.
+
+Sign convention: the metal note derives with H' = +E·r; this engine's
+established output convention is H' = -E·r (see CLAUDE.md), so the
+thermal and RTA assemblies carry an overall factor of -1 relative to the
+note.  Verified: thermal == subspace on insulators at βE_gap >> 1.
 
 Config keys read from cfg['system']:
   wannier_r:       Wannier-gauge position correction; see calc/wannier_gauge.py
@@ -48,22 +79,54 @@ from .wannier_gauge import (
 
 DEG_THR_DEFAULT = 1e-5
 ETA_SOS_DEFAULT = 0.05
+# Below this |w_pq| the divided difference F_pq = f_pq/w_pq is replaced by
+# f'(E) at the midpoint energy (its exact w -> 0 limit).
+F_DEG_THR = 1e-7
 _DIR = {'x': 0, 'y': 1, 'z': 2}
 
 # One-time deprecation warning bookkeeping.
 _DEG_THR_WARNED = False
+_ETA_THERMAL_WARNED = False
 
 # Term-decomposition names.  The subspace formulation carries an extra
 # 'T_mix' term from inner three-band sums restricted to the occupied
-# manifold (see delta_Q_occ_derivation.tex, II_mix + III_mix).
+# manifold (see delta_Q_occ_derivation.tex, II_mix + III_mix).  The
+# thermal formulation merges the dipole/mix three-band split into a
+# single T_3band and adds the 'T_loop' triple sum (which vanishes for
+# T=0 insulators by occupation algebra).
 _TERM_NAMES_BAND = ('T_Sipe_Delta', 'T_Sipe_d2H', 'T_Sipe_3band',
                     'T_Sipe_wannier_corr', 'T_Delta', 'T_3band')
 _TERM_NAMES_SUBSPACE = _TERM_NAMES_BAND + ('T_mix',)
+_TERM_NAMES_THERMAL = _TERM_NAMES_BAND + ('T_loop',)
+
+_FORMULATIONS = ('thermal', 'subspace', 'band')
 
 
-def _term_names(dQ_occupied_subspace):
-    return (list(_TERM_NAMES_SUBSPACE) if dQ_occupied_subspace
-            else list(_TERM_NAMES_BAND))
+def _term_names(formulation):
+    if formulation == 'thermal':
+        return list(_TERM_NAMES_THERMAL)
+    if formulation == 'subspace':
+        return list(_TERM_NAMES_SUBSPACE)
+    return list(_TERM_NAMES_BAND)
+
+
+def _resolve_formulation(formulation, dQ_occupied_subspace):
+    """Resolve the formulation name from the new and legacy config keys."""
+    if formulation is not None and dQ_occupied_subspace is not None:
+        raise ValueError(
+            "delta_Q: give either 'formulation' or the legacy "
+            "'dQ_occupied_subspace', not both"
+        )
+    if formulation is None:
+        if dQ_occupied_subspace is None:
+            return 'thermal'
+        return 'subspace' if dQ_occupied_subspace else 'band'
+    if formulation not in _FORMULATIONS:
+        raise ValueError(
+            f"delta_Q: unknown formulation '{formulation}'; "
+            f"expected one of {_FORMULATIONS}"
+        )
+    return formulation
 
 
 # ---------------------------------------------------------------------------
@@ -114,13 +177,35 @@ def compute_delta_Q(system: System, cfg: dict) -> dict:
     # engines cannot drift apart again.
     wannier_r = resolve_wannier_r(cfg, system, 'delta_Q')
 
-    # Whether to compute the DC response of the occupied-subspace QGT
-    # Q_occ^{ab} = Tr[P_occ (∂_a P_occ)(∂_b P_occ)], as derived in
-    # delta_Q_occ_derivation.tex.  When True (default), the outer band
-    # sums are restricted to (p∈occ, q∈unocc) pairs via a Pauli mask
-    # f_p (1-f_q), and one additional 'T_mix' term appears.  When False,
-    # the code reverts to the band-resolved Σ_n δQ_n form.
-    dQ_occupied_subspace = bool(calc.get('dQ_occupied_subspace', True))
+    # Formulation selection: 'thermal' (default; metals at finite T,
+    # delta_Q_metal_finite_T.pdf), 'subspace' (T=0 occupied projector,
+    # delta_Q_occ_derivation.tex), or 'band' (band-resolved Eq. 40).
+    # Legacy dQ_occupied_subspace: true/false maps to subspace/band.
+    legacy_key = calc.get('dQ_occupied_subspace')
+    if legacy_key is not None:
+        legacy_key = bool(legacy_key)
+    formulation = _resolve_formulation(calc.get('formulation'), legacy_key)
+
+    # The extrinsic RTA transport piece is always computed on the thermal
+    # path (O(N²), negligible next to the O(N³) intrinsic assembly) and
+    # reported PER UNIT τ as 'delta_Q_tau'.  Reject a 'tau' key so nobody
+    # mistakes the output for having a τ factor already applied.
+    if 'tau' in calc:
+        raise ValueError(
+            "delta_Q: 'tau' is not a config key. The RTA piece is always "
+            "computed with the thermal formulation and reported per unit "
+            "tau as 'delta_Q_tau' — multiply by your relaxation time."
+        )
+    with_tau = (formulation == 'thermal')
+
+    # The thermal path has no adiabatic iη — finite kT is the regulator.
+    global _ETA_THERMAL_WARNED
+    if formulation == 'thermal' and eta != 0.0 and not _ETA_THERMAL_WARNED:
+        parallel.print_root(
+            "  [delta_Q] NOTE: 'eta' is ignored by the thermal "
+            "formulation (finite kT is the regulator)."
+        )
+        _ETA_THERMAL_WARNED = True
 
     # Parse field direction(s)
     fd = calc.get('field_direction', calc.get('directions', ['x']))
@@ -148,7 +233,8 @@ def compute_delta_Q(system: System, cfg: dict) -> dict:
     parallel.print_root(
         f"  Delta Q: components={ab_pairs}, field_direction={field_dirs}, "
         f"eta={eta}, eta_sos={eta_sos}, wannier_r={wannier_r}, "
-        f"dQ_occupied_subspace={dQ_occupied_subspace}"
+        f"formulation={formulation}"
+        + (" (+ delta_Q_tau per unit tau)" if with_tau else "")
     )
 
     b1, b2, _b3 = get_reciprocal_lattice(system.unitcell_vectors)
@@ -185,14 +271,17 @@ def compute_delta_Q(system: System, cfg: dict) -> dict:
     my_indices, my_klist = parallel.scatter_work(k_list)
 
     # Term names depend on the formulation:
-    #   band-resolved: 6 terms (default pre-2026-04-20 behavior).
-    #   subspace:      6 terms + 'T_mix' (inner 3-band sum restricted to
-    #                  the occupied manifold; see derivation).
-    TERM_NAMES = _term_names(dQ_occupied_subspace)
+    #   band:     6 terms (band-resolved Eq. 40).
+    #   subspace: 6 terms + 'T_mix' (inner 3-band sum restricted to the
+    #             occupied manifold; see derivation).
+    #   thermal:  6 terms + 'T_loop' (finite-T triple sum; the merged
+    #             three-band sums live under 'T_3band').
+    TERM_NAMES = _term_names(formulation)
 
     # Local accumulators
     local_dQ = {}
     local_dQ_terms = {}
+    local_dQ_tau = {} if with_tau else None
     for ab in ab_pairs:
         a, b = ab
         local_dQ.setdefault(a, {})
@@ -203,6 +292,11 @@ def compute_delta_Q(system: System, cfg: dict) -> dict:
             local_dQ[a][b][c] = np.zeros(nef, dtype=complex)
             local_dQ_terms[a][b][c] = {t: np.zeros(nef, dtype=complex)
                                        for t in TERM_NAMES}
+        if local_dQ_tau is not None:
+            local_dQ_tau.setdefault(a, {})
+            local_dQ_tau[a].setdefault(b, {})
+            for c in field_dirs:
+                local_dQ_tau[a][b][c] = np.zeros(nef, dtype=complex)
 
     warnings.filterwarnings('ignore', category=RuntimeWarning)
 
@@ -214,11 +308,11 @@ def compute_delta_Q(system: System, cfg: dict) -> dict:
                 print(f"  k-point {done}/{total_local} on rank 0 "
                       f"({100 * done / total_local:.0f}%)")
 
-        kpt, kpt_terms = _process_kpoint(
+        kpt, kpt_terms, kpt_tau = _process_kpoint(
             system, tk, dir_chars, ab_pairs, field_dirs,
             eflist, kT, nef, eta, eta_sos=eta_sos,
             wannier_r=wannier_r,
-            dQ_occupied_subspace=dQ_occupied_subspace,
+            formulation=formulation,
         )
 
         for ab in ab_pairs:
@@ -227,9 +321,12 @@ def compute_delta_Q(system: System, cfg: dict) -> dict:
                 local_dQ[a][b][c] += kpt[a][b][c] * norm
                 for t in TERM_NAMES:
                     local_dQ_terms[a][b][c][t] += kpt_terms[a][b][c][t] * norm
+                if local_dQ_tau is not None:
+                    local_dQ_tau[a][b][c] += kpt_tau[a][b][c] * norm
 
     # Reduce across all ranks
     delta_Q_terms = {}
+    delta_Q_tau = {} if local_dQ_tau is not None else None
     for ab in ab_pairs:
         a, b = ab
         delta_Q_terms.setdefault(a, {})
@@ -243,8 +340,19 @@ def compute_delta_Q(system: System, cfg: dict) -> dict:
                 delta_Q_terms[a][b][c][t] = parallel.reduce_sum_complex_array(
                     local_dQ_terms[a][b][c][t]
                 )
+        if delta_Q_tau is not None:
+            delta_Q_tau.setdefault(a, {})
+            delta_Q_tau[a].setdefault(b, {})
+            for c in field_dirs:
+                delta_Q_tau[a][b][c] = parallel.reduce_sum_complex_array(
+                    local_dQ_tau[a][b][c]
+                )
 
-    return {'Q_tilde': {}, 'delta_Q': delta_Q, 'delta_Q_terms': delta_Q_terms}
+    result = {'Q_tilde': {}, 'delta_Q': delta_Q,
+              'delta_Q_terms': delta_Q_terms}
+    if delta_Q_tau is not None:
+        result['delta_Q_tau'] = delta_Q_tau
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -254,14 +362,21 @@ def compute_delta_Q(system: System, cfg: dict) -> dict:
 def _process_kpoint(system, k, dir_chars, ab_pairs, field_dirs,
                     eflist, kT, nef, eta, eta_sos=ETA_SOS_DEFAULT,
                     deg_thr=None, wannier_r=WANNIER_R_DEFAULT,
-                    dQ_occupied_subspace=True):
+                    dQ_occupied_subspace=None, formulation=None):
     """Process a single k-point: diagonalize, build operators, assemble dQ.
+
+    Returns (result, result_terms, result_tau); result_tau holds the RTA
+    transport piece PER UNIT tau on the thermal path, None otherwise.
 
     Near-degeneracy handling uses Souza Lorentzian regularization:
       inv_de[n,m] = w_{nm} / (w_{nm}^2 + eta_sos^2)
     which is bounded at w_{nm} -> 0 and reduces to 1/w_{nm} for
     |w_{nm}| >> eta_sos.  The `deg_thr` argument is retained for
     backward compatibility but ignored.
+
+    `formulation` selects the assembly ('thermal'/'subspace'/'band');
+    the legacy boolean `dQ_occupied_subspace` maps to subspace/band.
+    When neither is given the default is 'thermal'.
 
     When ``wannier_r`` is True and the system carries
     ``wannier_r_matrices``, the interband position operator ``rmtx`` and
@@ -270,6 +385,7 @@ def _process_kpoint(system, k, dir_chars, ab_pairs, field_dirs,
     contribution is registered as a separate 'wannier_corr' entry of
     ``dk_rmtx_terms`` so that downstream code can decompose it.
     """
+    formulation = _resolve_formulation(formulation, dQ_occupied_subspace)
     # Diagonalize with 2nd-order derivatives (needed for Sipe sum rule)
     H, S, vtb = get_H_v(system, k, order=2)
     ek, psi = diagonalize_hk(H, S, eigenvectors=True)
@@ -380,11 +496,12 @@ def _process_kpoint(system, k, dir_chars, ab_pairs, field_dirs,
                 dk_rmtx[d1][d2] = dk_rmtx[d1][d2] + corr
                 dk_rmtx_terms[d1][d2]['wannier_corr'] = corr
 
-    TERM_NAMES = _term_names(dQ_occupied_subspace)
+    TERM_NAMES = _term_names(formulation)
 
     # Initialize result containers.
     result = {}
     result_terms = {}
+    result_tau = {} if formulation == 'thermal' else None
     for ab in ab_pairs:
         a, b = ab
         result.setdefault(a, {})
@@ -395,8 +512,13 @@ def _process_kpoint(system, k, dir_chars, ab_pairs, field_dirs,
             result[a][b][c] = np.zeros(nef, dtype=complex)
             result_terms[a][b][c] = {t: np.zeros(nef, dtype=complex)
                                      for t in TERM_NAMES}
+        if result_tau is not None:
+            result_tau.setdefault(a, {})
+            result_tau[a].setdefault(b, {})
+            for c in field_dirs:
+                result_tau[a][b][c] = np.zeros(nef, dtype=complex)
 
-    if not dQ_occupied_subspace:
+    if formulation == 'band':
         # Band-resolved path: dQ^{ab}_n(c) per band, summed with Fermi weight.
         dQ_band = {}
         dQ_band_terms = {}
@@ -424,7 +546,7 @@ def _process_kpoint(system, k, dir_chars, ab_pairs, field_dirs,
                         result_terms[a][b][c][t][efc] = np.sum(
                             f * dQ_band_terms[a][b][c][t]
                         )
-    else:
+    elif formulation == 'subspace':
         # Subspace path: Q_occ = Tr[P_occ ∂P_occ ∂P_occ] response, with
         # outer Pauli mask f_p(1-f_q) + one new 'T_mix' piece per ef.
         # We rebuild pair matrices per ef (cheap since nef is small and
@@ -444,7 +566,28 @@ def _process_kpoint(system, k, dir_chars, ab_pairs, field_dirs,
                     for t in TERM_NAMES:
                         result_terms[a][b][c][t][efc] = terms_abc[t]
 
-    return result, result_terms
+    else:
+        # Thermal path: δQ^{ab}_T of ρ = f(H) (metal note Eq. eq:final),
+        # ×(-1) for the engine's H' = -E·r convention.  All occupation
+        # weights are per-ef; the operator build above is shared.
+        for efc in range(nef):
+            ef = eflist[efc]
+            f, fp, fpp, fd, F = _thermal_tables(ek, de, ef, kT)
+            for ab in ab_pairs:
+                a, b = ab
+                for c in field_dirs:
+                    total_abc, terms_abc = _assemble_delta_Q_thermal(
+                        rmtx, dk_rmtx_terms, Delta, f, fd, F, a, b, c,
+                    )
+                    result[a][b][c][efc] = total_abc
+                    for t in TERM_NAMES:
+                        result_terms[a][b][c][t][efc] = terms_abc[t]
+                    result_tau[a][b][c][efc] = _assemble_delta_Q_rta(
+                        vmtx, rmtx, vvmtx, vdiag, inv_de,
+                        f, fp, fpp, fd, a, b, c,
+                    )
+
+    return result, result_terms, result_tau
 
 
 # ---------------------------------------------------------------------------
@@ -601,6 +744,135 @@ def _compute_T_mix_pair(vmtx, rmtx, inv_de, inv_de_p, inv_de_m, a, b, c, f):
     mix_III = vmtx[a] * inv_de * inner_III_lj.T
 
     return mix_II + mix_III
+
+
+# ---------------------------------------------------------------------------
+# Thermal (metallic, finite-T) formulation — delta_Q_metal_finite_T.pdf
+# ---------------------------------------------------------------------------
+
+def _thermal_tables(ek, de, ef, kT):
+    r"""Occupation tables for the thermal formulation at one (k, ef).
+
+    Returns (f, fp, fpp, fd, F):
+      f    Fermi factors f(E_n)
+      fp   f'(E_n) = -f(1-f)/kT
+      fpp  f''(E_n) = f(1-f)(1-2f)/kT^2
+      fd   fd[p,q] = f_p - f_q
+      F    divided difference F[p,q] = (f_p - f_q)/w_pq — smooth and
+           symmetric; replaced by its exact w -> 0 limit f'((E_p+E_q)/2)
+           when |w_pq| < F_DEG_THR, so it is regular at degeneracies.
+    """
+    x = np.clip((ek - ef) / kT, -500, 500)
+    f = 1.0 / (1.0 + np.exp(x))
+    fp = -f * (1.0 - f) / kT
+    fpp = f * (1.0 - f) * (1.0 - 2.0 * f) / kT ** 2
+
+    fd = f[:, None] - f[None, :]
+
+    xm = np.clip((0.5 * (ek[:, None] + ek[None, :]) - ef) / kT, -500, 500)
+    fm = 1.0 / (1.0 + np.exp(xm))
+    fpm = -fm * (1.0 - fm) / kT
+
+    big = np.abs(de) > F_DEG_THR
+    F = np.where(big, fd / np.where(big, de, 1.0), fpm)
+    return f, fp, fpp, fd, F
+
+
+def _assemble_delta_Q_thermal(rmtx, dk_rmtx_terms, Delta, f, fd, F, a, b, c):
+    r"""Compute δQ^{ab}_T(c) for the thermal density matrix ρ = f(H).
+
+    Implements Eq. eq:final of delta_Q_metal_finite_T.pdf with the
+    regular-weight rewrite W_pq/w_pq = f_p f_pq F_pq and
+    W_pq/w_pq^2 = f_p F_pq^2 (no bare 1/w in any occupation weight; the
+    only 1/w factors live inside rmtx / dk_rmtx, Souza-regularized as
+    everywhere else).  No occupation restrictions anywhere — the smooth
+    weights do the Pauli blocking, and the zero diagonals of rmtx and
+    F*rmtx[c] make the p != q / l != p,q restrictions automatic, so no
+    explicit nondeg masking is needed.
+
+    Term decomposition: the four T_Sipe_* names split the r^{c;a}/r^{c;b}
+    bracket by dk_rmtx sub-term (as in the other formulations), T_Delta
+    is the Δ bracket, T_3band the merged three-band sums (insulator
+    limit: old T_3band + T_mix), T_loop the finite-T triple sum
+    (vanishes at T=0 by occupation algebra).
+
+    The note derives with H' = +E·r; the engine convention is H' = -E·r,
+    hence the overall factor of -1 applied to every term.
+    """
+    mask1 = f[:, None] * fd          # f_p f_pq
+    w_sipe = mask1 * F               # W_pq / w_pq
+    w_delta = f[:, None] * F ** 2    # W_pq / w_pq^2
+
+    note = {}
+
+    # Line 1, Sipe bracket: i Σ (W/w) [r^a_pq r^{c;b}_qp - r^{c;a}_pq r^b_qp]
+    for sub, name in (('delta', 'T_Sipe_Delta'),
+                      ('d2H', 'T_Sipe_d2H'),
+                      ('3band', 'T_Sipe_3band'),
+                      ('wannier_corr', 'T_Sipe_wannier_corr')):
+        s_ca = dk_rmtx_terms[c][a][sub]
+        s_cb = dk_rmtx_terms[c][b][sub]
+        note[name] = 1j * np.sum(
+            w_sipe * (rmtx[a] * s_cb.T - s_ca * rmtx[b].T)
+        )
+
+    # Line 1, Δ bracket: i Σ (W/w²) [Δ^a r^c_pq r^b_qp - Δ^b r^a_pq r^c_qp]
+    note['T_Delta'] = 1j * np.sum(
+        w_delta * (Delta[a] * rmtx[c] * rmtx[b].T
+                   - Delta[b] * rmtx[a] * rmtx[c].T)
+    )
+
+    # Line 2, loop term: -Σ_{pql distinct} F_pq f_ql f_lp r^c_pq r^a_ql r^b_lp
+    Frc = F * rmtx[c]
+    note['T_loop'] = -np.trace(Frc @ (fd * rmtx[a]) @ (fd * rmtx[b]))
+
+    # Lines 3+4, merged three-band sums via commutators K_x = [r^x, F∘r^c]:
+    #   -Σ f_p f_pq K_a[p,q] r^b_qp + Σ f_p f_pq r^a_pq K_b[q,p]
+    K_a = rmtx[a] @ Frc - Frc @ rmtx[a]
+    K_b = rmtx[b] @ Frc - Frc @ rmtx[b]
+    note['T_3band'] = (-np.sum(mask1 * K_a * rmtx[b].T)
+                       + np.sum(mask1 * rmtx[a] * K_b.T))
+
+    # Engine sign convention (H' = -E·r) flips the note's H' = +E·r result.
+    terms = {name: -val for name, val in note.items()}
+    total = sum(terms.values())
+    return total, terms
+
+
+def _assemble_delta_Q_rta(vmtx, rmtx, vvmtx, vdiag, inv_de,
+                          f, fp, fpp, fd, a, b, c):
+    r"""RTA transport piece δQ^{ab}_τ / τ (note Eq. eq:dQtau, PER UNIT τ).
+
+    The shifted-Fermi-sea response: δρ_pp = τ f'_p v^c_pp ≡ τ D_p
+    inserted into the three traces; the exact linearity in τ is why the
+    coefficient is reported and τ never enters the engine.  Purely
+    two-band, O(N²); needs the inverse-mass tensor via the standard sum
+    rule (note Eq. eq:mass) from the already-carried w^{ab} matrix
+    elements.  Reported per unit field, additive to (but never summed
+    into) the intrinsic result.  Carries the same overall -1
+    engine-convention factor as the intrinsic thermal assembly.
+    """
+    D = fp * vdiag[c]
+
+    # Inverse mass M^{xc}_p = w^{xc}_pp + 2 Re Σ_l v^x_pl v^c_lp / w_pl
+    def mass(x):
+        return (np.diag(vvmtx[x + c]).real
+                + 2.0 * np.real(
+                    np.sum(vmtx[x] * vmtx[c].T * inv_de, axis=1)))
+
+    dDa = fpp * vdiag[a] * vdiag[c] + fp * mass(a)
+    dDb = fpp * vdiag[b] * vdiag[c] + fp * mass(b)
+
+    # Off-diagonal: Σ_{p≠q} [D_p f_pq² + 2 f_p f_pq (D_p - D_q)] r^a_pq r^b_qp
+    Dd = D[:, None] - D[None, :]
+    W_off = D[:, None] * fd ** 2 + 2.0 * f[:, None] * fd * Dd
+    off = np.sum(W_off * rmtx[a] * rmtx[b].T)
+
+    # Diagonal (Fermi-surface): Σ_p D_p f'² v^a v^b + f f' (v^b ∂aD + v^a ∂bD)
+    diag = np.sum(D * fp ** 2 * vdiag[a] * vdiag[b]
+                  + f * fp * (vdiag[b] * dDa + vdiag[a] * dDb))
+
+    return -(off + diag)
 
 
 # ---------------------------------------------------------------------------

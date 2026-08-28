@@ -839,7 +839,10 @@ inconsistency that predates the shared position operator.
 #### `compute_delta_Q(system, cfg) -> dict`
 
 DC field-induced change in the quantum geometric tensor, δQ^{ab} for a static
-field along `c`. Implements Eq. 40 of `revised_formula_sheet_eta.pdf`.
+field along `c`. Three formulations (see below): `thermal` implements
+Eq. eq:final of `delta_Q_metal_finite_T.pdf` (metals at finite T),
+`subspace` the T=0 occupied projector of `delta_Q_occ_derivation`, and
+`band` Eq. 40 of `revised_formula_sheet_eta.pdf`.
 
 > ⚠️ Shares `compute_A_W_k` with `nonlinear_optical.py` and
 > `quantum_metric.py`, and that function is currently broken for Wannier input
@@ -849,14 +852,15 @@ field along `c`. Implements Eq. 40 of `revised_formula_sheet_eta.pdf`.
 > `compute_A_W_k` correctly returns `None`.
 
 **Returns** `{'Q_tilde': {}, 'delta_Q': ..., 'delta_Q_terms': ...}` with
-`delta_Q[a][b][c] -> array(nef,)`. `Q_tilde` is always empty.
+`delta_Q[a][b][c] -> array(nef,)`; plus `'delta_Q_tau'` (same nesting, **per
+unit τ**) with the thermal formulation. `Q_tilde` is always empty.
 
 **Broadening — three distinct parameters, easily confused:**
 
 | symbol | where it enters |
 |---|---|
-| `eta` | the DC-perturbation denominators only: `1/(ω_nm ± iη)` |
-| `eta_sos` | Souza regularization of the *bare* `1/ω_nm`: `ω/(ω² + η_sos²)` |
+| `eta` | the DC-perturbation denominators only: `1/(ω_nm ± iη)` — band/subspace paths; **ignored by thermal** (finite kT is the regulator) |
+| `eta_sos` | Souza regularization of the *bare* `1/ω_nm`: `ω/(ω² + η_sos²)` — all paths |
 | — | projector-derivative factors (`v/ω`) stay bare apart from `eta_sos` |
 
 The `+iη`/`−iη` split across Trace II and Trace III is what preserves
@@ -864,24 +868,45 @@ Hermiticity of δP_n. `eta_sos` defaults to `0.05`, large enough to matter in
 low-energy models. `deg_thr` is accepted for backward compatibility, ignored,
 and warned about once.
 
-**Two formulations**, selected by `dQ_occupied_subspace` (default `True`):
+**Three formulations**, selected by `formulation` (default `'thermal'`; the
+legacy boolean `dQ_occupied_subspace` maps to `subspace`/`band`, and giving
+both keys raises):
 
+- **Thermal** (`_assemble_delta_Q_thermal`) — responds
+  `Q_T = Tr[ρ ∂ₐρ ∂_b ρ]` with ρ = f(H); valid for metals at finite T
+  (`delta_Q_metal_finite_T.pdf`, Eq. eq:final, times −1 for the engine's
+  `H' = -E·r` convention). Occupation weights are assembled from
+  `f_p f_pq` and the divided difference `F_pq = f_pq/ω_pq` (guarded by
+  `F_DEG_THR = 1e-7`, below which `F → f'` at the midpoint energy) so that
+  **no occupation weight carries a bare 1/ω**: `W/ω = f_p·f_pq·F` and
+  `W/ω² = f_p·F²`. All f′ terms cancel identically (proven in the note,
+  exercised by the test). The p≠q / l≠p,q restrictions are automatic from the
+  zero diagonals of `rmtx` and `F∘r^c` — no `nondeg` masking in this path.
+  `_assemble_delta_Q_rta` always adds the extrinsic shifted-Fermi-sea piece
+  (O(N²), uses f′, f″ and the inverse-mass sum rule from `vvmtx`), reported
+  separately as `delta_Q_tau` **per unit τ** — δQ_τ is exactly linear in τ, so
+  the coefficient is the natural output and a `calc.tau` key raises.
 - **Subspace** (`_assemble_delta_Q_subspace`) — responds
   `Q_occ = Tr[P_occ ∂ₐP_occ ∂_b P_occ]`. The outer (p,q) sum is masked by
   `f_p (1 - f_q)`, and an extra `T_mix` term appears from inner three-band sums
   whose intermediate index is restricted to the occupied manifold. Note the
   derivation literally gives `f_p (f_q - f_p)`; the code uses `f_p (1 - f_q)`
   for consistency with the interband convention elsewhere, differing by a
-  self-smear term negligible for `kT ≪ gap`.
+  self-smear term negligible for `kT ≪ gap`. The thermal formulation is the
+  exact finite-T version of this and reproduces it at `kT ≪ gap`.
 - **Band-resolved** (`_assemble_delta_Q`) — `Σ_n f_n δQ^{ab}_n`, 6 terms, no
   `T_mix`.
 
-Both share `_compute_pair_matrices`, which returns the pair integrands before
-the outer contraction; only the outer mask differs. That is what keeps the two
-paths from drifting.
+Subspace and band share `_compute_pair_matrices`, which returns the pair
+integrands before the outer contraction; only the outer mask differs. The
+thermal path has its own assembly (the weights differ in *structure*, not just
+mask) but is pinned to the others by the insulator-limit regression in
+`examples/test_dQ_thermal.py`.
 
 **Term names:** `T_Sipe_Delta`, `T_Sipe_d2H`, `T_Sipe_3band`,
-`T_Sipe_wannier_corr`, `T_Delta`, `T_3band` (+ `T_mix` in the subspace path).
+`T_Sipe_wannier_corr`, `T_Delta`, `T_3band` (+ `T_mix` in the subspace path,
++ `T_loop` in the thermal path — the finite-T triple sum, dead at T=0; the
+thermal `T_3band` is the merged image of the insulator `T_3band + T_mix`).
 The four `T_Sipe_*` pieces sum exactly to the full Sipe generalized derivative —
 `wannier_corr` is pre-populated with zeros so the bookkeeping holds whether or
 not the system carries Wannier position matrices.
@@ -889,8 +914,11 @@ not the system carries Wannier position matrices.
 **k-grid:** 2D only — `nk1, nk2 = calc['nk']` unpacks exactly two entries.
 Periodic spacing `db = b/nk`.
 
-**Sign convention:** the implemented Eq. 40 corresponds to `H' = -E·r`; notes
-written with `H' = +E·r` differ by an overall minus, verified pointwise.
+**Sign convention:** every path corresponds to `H' = -E·r`; notes written with
+`H' = +E·r` differ by an overall minus, verified pointwise. In particular
+`delta_Q_metal_finite_T.pdf` uses `+E·r`, so `_assemble_delta_Q_thermal` and
+`_assemble_delta_Q_rta` carry an explicit overall −1 relative to that note
+(pinned by the thermal/subspace ratio = +1 regression).
 
 **Serialization caveat:** `_save_delta_Q` writes the term decomposition under
 5-part keys `delta_Q_terms.<a>.<b>.<c>.<term>`, but `load_delta_Q` only handles

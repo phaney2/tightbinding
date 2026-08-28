@@ -515,7 +515,11 @@ result, cfg = load_quantum_metric('results/qm')
 ### DC Field-Induced Quantum Geometry (`delta_Q`)
 
 Computes δQ^{ab}, the change in the quantum geometric tensor produced by a
-static electric field along direction `c`, with adiabatic iη broadening.
+static electric field along direction `c`. The default `thermal` formulation
+responds the thermal density matrix ρ = f(H) and is valid for **metals at
+finite temperature** (reference: `delta_Q_metal_finite_T.pdf`); the legacy
+`subspace` (T=0 occupied projector) and `band` (band-resolved, adiabatic iη)
+formulations remain available.
 
 > ⚠️ **Read the blocking-bug notice in `CLAUDE.md` before running this on
 > Wannier (`_tb.dat`) input.** `delta_Q` shares the Wannier-gauge position
@@ -527,10 +531,11 @@ static electric field along direction `c`, with adiabatic iη broadening.
 ```yaml
 calc:
   type: delta_Q
+  formulation: thermal      # default | subspace | band
   nk: [60, 60]              # 2D grid — exactly two entries required
   eflist: [2.0]             # Fermi energies
   kT: 0.1                   # temperature (eV)
-  eta: 0.1                  # adiabatic broadening (optional, default 0.0)
+  eta: 0.1                  # adiabatic broadening (band/subspace only)
   eta_sos: 0.05             # Souza regularization of 1/w_nm (optional)
   components: [xz, zx]      # (a,b) metric index pairs, or 'all'
   field_direction: x        # DC field direction c — string or list
@@ -542,21 +547,46 @@ The Wannier-gauge position correction is controlled by `system.wannier_r`, not
 by anything in `calc:` — see [`wannier_r`](#wannier_r--the-wannier-gauge-position-correction).
 A stale `calc.wannier_r` is an error, not a silently ignored key.
 
-One additional switch, defaulting to `true`:
+**Formulations:**
 
-- `dQ_occupied_subspace` — respond the occupied-subspace tensor
-  `Q_occ = Tr[P_occ ∂ₐP_occ ∂_b P_occ]`, restricting the outer band sum to
-  occupied→unoccupied pairs. Setting `false` reverts to the band-resolved
-  `Σ_n f_n δQ_n` form and drops the extra `T_mix` term.
+- `thermal` (default) — δQ^{ab}_T of ρ = f(H). Works for metals: the sharp
+  occ/un masks become smooth weights built from `f_p - f_q` and the divided
+  difference `F_pq = (f_p - f_q)/ω_pq`, which is regular at degeneracies. A new
+  `T_loop` term appears (vanishes for T=0 insulators); the insulator dipole/mix
+  three-band split merges into a single `T_3band`. **`eta` is ignored** on this
+  path — finite `kT` is the regulator, so converge `nk` together with `kT`.
+  Reproduces the `subspace` result on insulators at `kT ≪ gap` to exponential
+  accuracy. The extrinsic RTA piece is always computed alongside and reported
+  separately, per unit τ (see below).
+- `subspace` — the T=0 occupied-projector formulation with Pauli mask
+  `f_p (1 - f_q)` and the extra `T_mix` term.
+- `band` — the band-resolved `Σ_n f_n δQ_n` form with adiabatic iη.
+
+The legacy boolean `dQ_occupied_subspace: true/false` still selects
+`subspace`/`band`; giving it together with `formulation` is an error.
 
 `deg_thr` is accepted but ignored (it was replaced by the `eta_sos`
 regularization); the code warns once if you pass it.
+
+**RTA transport piece (thermal only, always on, per unit τ).** The
+shifted-Fermi-sea (Boltzmann) response `δρ_pp = τ f'_p v^c_pp` adds a τ-linear,
+purely Fermi-surface contribution — the occupation dipole of the equilibrium
+geometry. Because it is exactly linear in τ, the engine reports the
+*coefficient* `delta_Q_tau` = δQ_τ/τ; multiply by your relaxation time
+afterwards. There is no switch (it is O(N²), negligible next to the intrinsic
+assembly), and a `calc.tau` key is rejected so the output is never mistaken
+for having a τ factor applied. It is **extrinsic** (diverges in the clean
+limit) and is reported separately, never summed into `delta_Q`. In a
+time-reversal-symmetric metal its BZ-integrated metric part vanishes
+identically; it dies exponentially in a gapped system.
 
 **Output:**
 - `result['delta_Q'][a][b][c]` → complex array of shape `(nef,)`
 - `result['delta_Q_terms'][a][b][c][term]` → same shape, per-term breakdown.
   Terms: `T_Sipe_Delta`, `T_Sipe_d2H`, `T_Sipe_3band`, `T_Sipe_wannier_corr`,
-  `T_Delta`, `T_3band`, plus `T_mix` when `dQ_occupied_subspace` is on.
+  `T_Delta`, `T_3band`, plus `T_mix` (subspace) or `T_loop` (thermal).
+- `result['delta_Q_tau'][a][b][c]` → same shape; thermal formulation only,
+  per unit τ.
 - `result['Q_tilde']` is present but always empty.
 
 **Reloading:**
@@ -567,8 +597,8 @@ result, cfg = load_delta_Q('results/dQ')
 # result['delta_Q']['x']['z']['x'] — array(nef,)
 ```
 
-Note: `load_delta_Q` returns only `Q_tilde` and `delta_Q`. The per-term
-decomposition *is* written to the `.npz` under keys
+Note: `load_delta_Q` returns `Q_tilde`, `delta_Q`, and `delta_Q_tau` (when it
+was computed). The per-term decomposition *is* written to the `.npz` under keys
 `delta_Q_terms.<a>.<b>.<c>.<term>`, but the loader drops them — read those
 directly with `np.load` if you need them.
 

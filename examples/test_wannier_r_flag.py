@@ -158,7 +158,7 @@ def run_chi2_slow(system, **kw):
 
 def run_dq(system, **kw):
     from tightbinding.calc.delta_Q import _process_kpoint
-    res, _terms = _process_kpoint(
+    res, _terms, _tau = _process_kpoint(
         system, K_TEST, DIRS, ['yy'], ['y'],
         np.array([0.0]), 1e-3, 1, 0.0, eta_sos=1e-8,
         dQ_occupied_subspace=True, **kw)

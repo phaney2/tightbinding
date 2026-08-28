@@ -114,6 +114,7 @@ Common workflow: user provides a PDF with derivations, Claude reads the equation
 - `examples/input_qm_test.yaml` — quantum metric (validated against MATLAB)
 - `examples/input_all_ek_test.yaml` — full BZ eigenvalues + DOS
 - `examples/input_delta_Q_test.yaml` — delta Q (2D square sp_u with Rashba)
+- `examples/input_delta_Q_metal.yaml` — delta Q of a *metal* (thermal formulation + RTA piece)
 - `examples/input_jdos_test.yaml` — joint density of states (2D square sp_u)
 - `examples/input_nonlinear_freq_integral.yaml` — analytic frequency-integrated chi^(2)
 - `examples/input_MoS2_bands.yaml` — MoS2 monolayer 11-band model (Mo d_u + S p_u, Cappelluti params)
@@ -306,26 +307,67 @@ invariant `chi_yyy = -chi_yxx = -chi_xxy = -chi_xyx` to 1e-12 on the integrated
 output, with the forbidden components at 1e-11 relative.
 
 ## Delta Q Engine
-DC field-induced change in the quantum geometric tensor, `delta_Q.py`. Implements Eq. 40 of `revised_formula_sheet_eta.pdf` with adiabatic iη broadening and three terms:
-- **T_Sipe**: dressed-dipole term using generalized derivatives r^{c;a} via Sipe sum rule
-- **T_Delta**: velocity-difference term
-- **T_3band**: three-band virtual transition term (fully vectorized via matrix products)
+DC field-induced change in the quantum geometric tensor, `delta_Q.py`. Three formulations,
+selected by `calc.formulation`:
 
-The iη broadening enters only the DC perturbation denominators (ω_{nm} → ω_{nm} ± iη), preserving Hermiticity of δP_n. Projector-derivative denominators (v/ω) remain bare.
+- **`thermal` (default)** — δQ^{ab}_T of the thermal density matrix ρ = f(H), valid for
+  **metals at finite temperature**. Reference: `delta_Q_metal_finite_T.pdf` (Eq. eq:final;
+  location in `CLAUDE.local.md`). Sharp occ/un masks are replaced by smooth weights
+  W_pq = f_p f_pq², F_pq = f_pq/ω_pq (divided difference, → f'(E) at degeneracies, guarded
+  below |ω| = 1e-7). All f' (Fermi-surface) terms cancel identically — proven in the note,
+  verified in the test — so the intrinsic response is purely interband even in a metal.
+  New `T_loop` term (triple sum, vanishes for T=0 insulators); the insulator dipole/mix
+  three-band split merges into a single `T_3band`. **No adiabatic iη** on this path —
+  finite kT is the regulator (`eta` is ignored with a note). Weights are assembled as
+  W/ω = f_p·f_pq·F and W/ω² = f_p·F², so no occupation weight carries a bare 1/ω; the
+  only 1/ω lives in r and r^{c;a} (Souza `eta_sos`, as everywhere).
+  Converge nk together with kT: the Fermi-surface structure sharpens as kT → 0.
+- **`subspace`** — T=0 occupied-projector formulation (`delta_Q_occ_derivation`), Pauli
+  mask f_p(1-f_q), extra `T_mix` term. Reproduced by `thermal` to exponential accuracy on
+  insulators at βE_gap ≫ 1 (verified: 2e-16 at βE_gap = 20).
+- **`band`** — band-resolved Σ_n f_n δQ^{ab}_n, Eq. 40 of `revised_formula_sheet_eta.pdf`,
+  with adiabatic iη in the DC perturbation denominators only.
 
-Output is Sum_n f_n * dQ^{ab}_n accumulated over the k-grid. Config:
+Legacy key `dQ_occupied_subspace: true/false` still maps to `subspace`/`band`; giving both
+keys is an error.
+
+**RTA transport piece — always computed on the thermal path, PER UNIT τ.** The extrinsic
+τ-linear Fermi-surface response δQ^{ab}_τ (shifted Fermi sea δρ = τ f' v^c, note
+Eq. eq:dQtau) is exactly linear in τ, so the engine reports the *coefficient*
+(`delta_Q_tau` = δQ_τ/τ; multiply by your relaxation time in post). It is O(N²) —
+free next to the O(N³) intrinsic assembly — so there is no switch; in insulators it
+comes out exponentially zero, which doubles as a sanity check. Never summed into
+`delta_Q` (it diverges in the clean limit; report the two pieces separately as in the
+nonlinear-Hall literature). A `calc.tau` key **raises**, so nobody mistakes the output
+for having a τ factor applied. In a TR-symmetric metal the BZ-integrated *metric* part
+of δQ_τ vanishes (Berry-curvature-dipole channel only).
+
+Config:
 ```yaml
 calc:
   type: delta_Q
-  components: [xz, zx]     # explicit (a,b) pairs, or 'all'
+  formulation: thermal      # default | subspace | band
+  components: [xz, zx]      # explicit (a,b) pairs, or 'all'
   field_direction: x        # DC field direction c (string or list)
   directions: [x, z]        # only needed when components='all'
   nk: [60, 60]
   eflist: [2.0]
   kT: 0.1
-  eta: 0.1                  # adiabatic broadening (default 0.0)
+  eta: 0.1                  # adiabatic broadening (band/subspace only)
 ```
-Uses `_compute_dk_rmtx` (Sipe sum rule) borrowed from `nonlinear_optical.py`. Sign convention: code and PDF both use r = -i*v/w; dk_rmtx[c][a] = r^{c;a} (no sign flip). Reference: `revised_formula_sheet_eta.pdf` (Eq. 40).
+Uses `_compute_dk_rmtx` (Sipe sum rule) borrowed from `nonlinear_optical.py`. Sign
+convention: code and PDFs use r = -i*v/w; dk_rmtx[c][a] = r^{c;a} (no sign flip).
+
+**Thermal-path sign.** `delta_Q_metal_finite_T.pdf` derives with H' = +E·r; the engine's
+established convention is H' = -E·r, so the thermal and RTA assemblies carry an overall
+factor of **-1** relative to that note (`_assemble_delta_Q_thermal`, `_assemble_delta_Q_rta`).
+Verified: thermal/subspace ratio = +1.000000 on the gapped honeycomb.
+
+**Validation** (`examples/test_dQ_thermal.py`, 19 checks): trace assembly
+Tr I+II+III == collected formula at 2e-15 on a random 5-band metal (incl. all f' pieces,
+so the cancellation theorem is exercised, not assumed); field+k finite-difference
+certificate at 4e-7; RTA vs operator traces at 2e-16, TR selection rule to machine
+precision; insulator limit == subspace at 2e-16.
 
 **Overall sign vs. the +E·r convention.** Eq. 40 as implemented corresponds to H' = -E·r. Notes written with H' = +E·r (e.g. `tmd_warping_note_corrected.pdf`, Eq. 7) give the *opposite* overall sign. Verified pointwise: `delta_Q` output = -1.000000 x (that note's Eq. 7) at every k and every (a,b,c) channel. Magnitude and all structure agree to machine precision — only the global sign differs.
 
