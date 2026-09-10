@@ -296,6 +296,44 @@ worst cancellation ratio at the end of a run; ~4e7 (≈8 digits lost in the wors
 kernel) at eta = 1e-3 on the honeycomb. Measured end-to-end accuracy there is
 still ~1e-8, i.e. two orders better than the 1e-6 quadrature ceiling.
 
+### The chi^(2) <-> delta_Q sum rule (checked 2026-09-10)
+
+    int_0^inf dw (1/w) Re chi^{abc}(w; w, 0)  =  pi * dQ^{ab}(c)
+
+with Re the dissipative part (chi_total is the conductivity) and dQ from
+`delta_Q` (thermal) on the same grid, same kT and eta_sos. Driver:
+`examples/check_sumrule_chi2_dQ.py` (all eight in-plane components, several
+index pairings, synthetic-connection models; `mpiexec` for MoS2). Findings:
+
+- **The pairing is the plain one.** Output a, omega-field b, DC-field c go with
+  dQ^{ab}(c). Established on the anisotropic honeycomb (C3 broken by 30%), where
+  every independent component obeys it and the alternative pairings fail by 15-20%.
+  yyy alone cannot distinguish pairings.
+- **Finite eta costs O(eta ln(1/eta)).** J/(pi dQ) = 1.0142, 1.0066, 1.0029, 1.0011 on
+  the honeycomb at eta = 1e-3, 3e-4, 1e-4, 3e-5 (gap 0.2); 1.00133, 1.00074, 1.00041
+  on MoS2 yyy at eta = 1e-3, 5e-4, 2.5e-4 (gap 1.76). Both fit A eta ln(1/eta) + B eta
+  with **no constant term**, so the eta -> 0 limit is 1 to better than 1e-4. The source
+  is the 1/(w + i eta)-type poles under the 1/w weight (the same crossover as the
+  `omega_min` window). Quote the sum rule with its eta, or extrapolate; the "7e-6" in
+  `NOTE_wannier_r_flag_consistency.md` is not a finite-eta number. Independent of nk
+  once converged (nk 120/240/480 identical to six digits on the honeycomb).
+- **With the Wannier correction on, the rule holds component-wise only for a = c.**
+  MoS2 (nk 200 and 300, any eta, eta_sos 0.025 or 1e-3): yyy, xyx, xxx at the eta
+  offset; xxy at 0.9786 and yxx at 1.0243, i.e. a deviation antisymmetric under a <-> c
+  whose sum obeys the rule. Not symmetry breaking of the Hamiltonian (correction off,
+  all eight components obey it on the same unsymmetrized file), not time reversal (the
+  in-plane position blocks are real to 6e-9; a real synthetic decoration with exact TRS
+  shows the same violation). It is the **non-Abelian curvature of the Wannier
+  connection**, F^{ac} = d_a A_c - d_c A_a - i[A_a, A_c]: a synthetic connection with
+  F = 0 exactly (`honeycomb_wflat`) obeys the rule in all components, one of the same
+  size with F != 0 (`honeycomb_wcurv`) reproduces the antisymmetric violation. The
+  projected position components of a truncated Wannier basis do not commute, and the
+  sum-rule derivation exchanges r^{a;c} for r^{c;a}, which costs an F^{ac} term. On MoS2
+  |F^{xy}| is 0.4-2.8 A^2 in the Hamiltonian gauge and the effect is 2.3%. The
+  (a <-> c)-symmetrized relation holds at the eta offset for every pair. For point-like
+  orbitals F = 0 identically, which is why the honeycomb never showed it. Decided
+  2026-09-10: no symmetrized redefinition, no explicit derivation of the F term.
+
 ### Implementation
 
 `freq_integral.py` exposes `rational_integral(p, poles, mults, a, b)`, a general

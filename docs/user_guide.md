@@ -481,6 +481,15 @@ cancel. Always quote `J` together with the `omega_min` it was computed at. If
 the diagnostic comes back at round-off, `J` is `omega_min`-independent and you
 can say so.
 
+**Sum rule.** `∫dω (1/ω) Re χ^{abc}(ω) = π dQ^{ab}(c)` with `dQ` from
+`calc.type: delta_Q` on the same grid; `examples/check_sumrule_chi2_dQ.py`
+runs both sides and prints the ratio. At finite `eta` the ratio is
+`1 + O(eta ln(1/eta))` (about 1.4% at `eta/E_gap = 0.005`), extrapolating to
+1; and with the Wannier-gauge correction on it holds component-wise only for
+`a = c`, the rest differing by a term antisymmetric in `a ↔ c` that comes from
+the curvature of the Wannier connection. See CLAUDE.md, "The chi^(2) <->
+delta_Q sum rule".
+
 **Accuracy.** The run prints a worst-case cancellation ratio; its base-10 log is
 roughly the number of digits lost to the nearly-coincident poles that the
 broadening creates. At `eta = 1e-3` this is ~8 digits in the worst kernel, with

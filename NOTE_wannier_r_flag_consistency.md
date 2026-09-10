@@ -133,4 +133,7 @@ regardless of the flag — the run banner now says so explicitly instead of
 leaving it ambiguous. The chi^(2) / `delta_Q` results in the honeycomb
 directories, including the `int dw (1/w) Re chi_yyy = pi * dQ^yyy` sum
 rule verified there to 7e-6, are untouched by this and by the open bug.
+*(2026-09-10: at finite eta that ratio is 1 + O(eta ln(1/eta)), e.g. 1.014 at
+eta = 1e-3; the 7e-6 is an eta -> 0 statement. See the sum-rule subsection
+of CLAUDE.md and `examples/check_sumrule_chi2_dQ.py`.)*
 The issue bites only Wannier `_tb.dat`-derived systems, i.e. the TMD set.
