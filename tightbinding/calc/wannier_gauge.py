@@ -1,30 +1,51 @@
 """Wannier-gauge position-operator correction: one switch, one kernel.
 
-A Hamiltonian read from a Wannier90 ``_tb.dat`` file is **not** in the atomic
-gauge, so the tight-binding form ``r = -i v / w`` is incomplete: the intra-cell
-part of the position operator has to be added back from the position matrices
-that ``_tb.dat`` carries alongside the Hamiltonian.  That correction is
-``A^(W)(k)`` (Eq. 20 of arXiv:1804.04030), computed here by `compute_A_W_k`,
-and applied by the engines as Eq. 22 (to ``r``) and Eq. 36 (to ``r^{a;b}``).
+`bloch.get_H_k` builds H(k) with Bloch phases exp(ik·(R + tau_m - tau_n)),
+tau being the orbital centres in ``system.atompos``.  For point-like orbitals
+sitting at tau (every ``build_system`` model) the position operator in that
+gauge is exactly r = -i v/w with no intra-cell term.  Wannier functions have
+a finite spread and off-diagonal dipoles, and a ``_tb.dat`` file carries
+them as <0n|r|Rm>; the part of r that r = -i v/w misses is the Wannier-gauge
+Berry connection
+
+    A^(W)_{nm,a}(k) = Σ_R exp(ik·(R + tau_m - tau_n)) <0n|r_a|Rm> - tau_{n,a} δ_nm
+
+computed by `compute_A_W_k` with the SAME tau the Bloch phases use, and
+applied by `apply_wannier_correction` to every operator an engine forms:
+
+    r^a_nm      += a^a_nm                      a = offdiag(U† A^(W) U)     (Eq. 22)
+    r^{a;b}     += covariant-derivative piece  (the full expression is in the
+                                                function docstring)
+    v^a_nm      += i w_nm a^a_nm               the physical current vertex
+
+while everything that is a derivative of H(k) itself — the group velocity
+Delta, the Sipe sum rule, the band curvature, the inverse mass — keeps the
+bare v.  The rule that fixes which is which: **every engine output must be
+independent of the gauge the system was built in** (its atompos).
+`examples/test_wannier_gauge.py` enforces that exactly, by re-expressing
+point-like models in other gauges (where A^(W) is then a known diagonal) and
+demanding the atomic-gauge answer back, and it checks the k-dependent term
+against finite differences on a real MoS2 connection.
 
 Every engine that builds a position operator reads the same switch from the
-same place through `resolve_wannier_r`, and gates the same kernel through the
-``enabled`` argument of `compute_A_W_k`.  That is deliberate: before this
-module existed the three engines each did their own thing (χ^(2) hard-wired
-ON, ``delta_Q`` switchable, ``quantum_metric`` hard-wired OFF) and drifted
-apart silently.  Add a new engine with a position operator, and it must go
-through these two functions.
+same place through `resolve_wannier_r`, gates the same kernel through the
+``enabled`` argument of `compute_A_W_k`, and applies it through
+`apply_wannier_correction`.  That is deliberate: before this module existed
+the three engines each did their own thing and drifted apart silently, and
+before the 2026-09 fix each carried its own copy of the Eq. 36 algebra, all
+wrong in the same way.  Add a new engine with a position operator, and it
+must go through these functions.
 
 Config::
 
     system:
       wannier_tb: mos2_tb.dat
-      wannier_r: false        # <- here, NOT under calc:
+      wannier_centres: mos2_centres.xyz   # recommended, see wannier.py
+      wannier_r: true         # <- here, NOT under calc:  (default)
 
 The correction is a **no-op** for systems built with ``build_system`` +
-``fill_hamiltonian``: `bloch.get_H_k` builds those in the atomic gauge, where
-``r = -i v / w`` holds exactly with zero intra-cell term.  Such systems carry
-no ``wannier_r_matrices`` and the flag is inert either way.
+``fill_hamiltonian`` and for ``_hr.dat`` input: they carry no
+``wannier_r_matrices`` and the flag is inert either way.
 """
 
 import numpy as np
@@ -36,14 +57,13 @@ from .. import parallel
 # The switch
 # ---------------------------------------------------------------------------
 
-# TODO: restore to True when BUG_wannier_r_correction.md is closed.
-#
-# The correction is *physically required* for Wannier input, so True is the
-# right long-run default.  It is False today only because `compute_A_W_k` is
-# known-defective (it makes delta_Q complex when it must be real, and gives
-# chi^(2) a sub-gap dissipative part that survives eta -> 0).  Neither setting
-# is correct on a _tb.dat system right now, which is why both of them warn.
-WANNIER_R_DEFAULT = False
+# The correction is physically required for Wannier input, so True is the
+# default.  False keeps the point-like-orbital approximation r = -i v/w (in
+# the atomic gauge, since `build_system_from_tb` always builds atompos from
+# the centres); it is a diagnostic setting, not a physics preference.  It was
+# False from 2026-08-27 to 2026-09-10 while BUG_wannier_r_correction.md was
+# open; that file records the defect and the fix.
+WANNIER_R_DEFAULT = True
 
 _CONFIG_KEY = 'wannier_r'
 
@@ -112,10 +132,9 @@ def resolve_wannier_r(cfg, system, engine) -> bool:
     system : the System being computed on; decides whether the flag is inert
     engine : engine name, used in the printed messages
 
-    Both settings are noisy on a system that actually carries position
-    matrices, because `BUG_wannier_r_correction.md` is open and neither
-    setting gives a trustworthy answer there.  ``False`` is not a fix for that
-    bug — it is a diagnostic that drops a physically required term.
+    On a system that carries position matrices, ``False`` prints a note
+    saying the finite-spread part of r is being dropped — it is a diagnostic
+    setting, not a physics preference.
     """
     validate_wannier_r(cfg)
 
@@ -131,19 +150,17 @@ def resolve_wannier_r(cfg, system, engine) -> bool:
     elif flag:
         _notice_once(
             engine, 'on',
-            f"  [{engine}] WARNING: wannier_r=True — the Wannier-gauge "
-            f"position correction is ENABLED and is known to be defective. "
-            f"See BUG_wannier_r_correction.md; results on _tb.dat input are "
-            f"contaminated."
+            f"  [{engine}] wannier_r=True: Wannier-gauge position correction "
+            f"enabled (finite-spread part of r from the _tb.dat position "
+            f"blocks, applied to r, r^{{a;b}} and the current vertex)"
         )
     else:
         _notice_once(
             engine, 'off',
-            f"  [{engine}] WARNING: wannier_r=False — the Wannier-gauge "
-            f"position correction is DISABLED. r = -i v/w is NOT the correct "
-            f"position operator for _tb.dat input; this is a diagnostic "
-            f"setting, not a physics preference. It is the default only while "
-            f"BUG_wannier_r_correction.md is open."
+            f"  [{engine}] NOTE: wannier_r=False — the finite-spread part of "
+            f"the position operator is DROPPED; r = -i v/w is the point-like-"
+            f"orbital approximation (atomic gauge). Diagnostic setting, not a "
+            f"physics preference."
         )
 
     return flag
@@ -169,23 +186,59 @@ def warn_unused_wannier_r(cfg, calc_type) -> None:
 # The kernel
 # ---------------------------------------------------------------------------
 
-def compute_A_W_k(system, k, dir_chars=None, enabled=True, need_deriv=True):
-    """Fourier-interpolate the Wannier position operator and its k-derivative.
+def wannier_centres_from_atompos(system):
+    """Per-orbital centres tau_j implied by ``system.atompos``, shape (norbs, 3).
 
-    Implements Eq. 20 of Ibañez-Azpiroz et al. (arXiv:1804.04030):
-        A^(W)_{k,nm,a} = Σ_R exp(ik·(R+τ_m-τ_n)) <0n|r̂_a - τ_{m,a}|Rm>
+    ``atompos.x[i, j] = tau_j - tau_i`` is exactly the intra-cell offset that
+    `bloch.get_H_k` puts in its Bloch phases, so row 0 is tau_j up to the
+    common constant tau_0.  A constant shift of every centre changes A^(W) by
+    a multiple of the identity, which drops out of everything built from it
+    (only off-diagonal parts and diagonal *differences* are ever used), so the
+    constant is immaterial.  Deriving tau from atompos, rather than from a
+    stored centre list, is what guarantees the connection and H(k) are in the
+    same gauge no matter how the system was built.
+    """
+    ap = system.atompos
+    return np.stack([np.real(ap.x[0]), np.real(ap.y[0]), np.real(ap.z[0])],
+                    axis=1)
+
+
+def compute_A_W_k(system, k, dir_chars=None, enabled=True, need_deriv=True):
+    """Fourier-interpolate the Wannier-gauge Berry connection and its k-derivative.
+
+    `bloch.get_H_k` builds H(k) with Bloch phases exp(ik·(R + tau_m - tau_n)),
+    tau being the intra-cell offsets in ``system.atompos``.  In that same gauge
+    the Berry connection A^(W)_a = i <u^(W)_n | d_a u^(W)_m> is
+
+        A^(W)_{nm,a}(k) = Σ_R exp(ik·(R + tau_m - tau_n)) <0n|r_a|Rm> - tau_{n,a} δ_nm
+
+    Eq. 20 of arXiv:1804.04030 is the tau = 0 (lattice-gauge) case; the tau
+    terms are the gauge transformation of A under the diagonal unitary
+    exp(ik·tau), and the subtracted centres are the SAME tau the Bloch phases
+    use — taken from atompos — so H(k) and A^(W)(k) are in one gauge by
+    construction.  For point-like orbitals sitting at tau the sum is exactly
+    tau_n δ_nm and A^(W) vanishes: that is the atomic-gauge TBA limit in which
+    r = -i v/w is complete.  The correction is therefore gauge-covariant: the
+    same physical system expressed with different atompos (including zero)
+    gives the same physical r once A^(W) is added — `examples/test_wannier_gauge.py`
+    checks exactly that.
 
     Returns (A_W, dA_W) where:
       A_W[d]       = A^(W)_d(k), shape (norbs, norbs)
       dA_W[d1][d2] = ∂_{d2} A^(W)_{d1}(k), shape (norbs, norbs)
+                     (the subtracted centres are k-independent)
 
     Returns (None, None) when `enabled` is False, or when the system has no
-    ``wannier_r_matrices`` (the atomic-gauge case, where the correction is
+    ``wannier_r_matrices`` (the point-like case, where the correction is
     identically zero).  Callers therefore need only the ``if A_W is not None:``
     guard they already have — the flag needs no separate branch.
 
     `need_deriv=False` skips ``dA_W`` (returned as None) for callers that only
     correct ``r`` and not its generalized derivative.
+
+    The position blocks are used as stored on the system.  `wannier.build_system_from_tb`
+    Hermitianizes them (r(-R) = r(R)^dagger) and repairs the R=0 diagonal
+    against the centres before storing, so A^(W)(k) here is Hermitian.
     """
     if not enabled:
         return None, None
@@ -204,48 +257,33 @@ def compute_A_W_k(system, k, dir_chars=None, enabled=True, need_deriv=True):
     if dir_chars is None:
         dir_chars = labels
 
-    # phase_ap[i,j] = exp(ik·(τ_j - τ_i))
+    # phase_ap[i,j] = exp(ik·(τ_j - τ_i)), the same factor get_H_k applies.
     phase_ap = np.exp(1j * (kx * ap.x + ky * ap.y + kz * ap.z))
+    tau = wannier_centres_from_atompos(system)          # (norbs, 3)
 
-    # Find R=0 index
-    r0_idx = None
-    for idx, R_latt in enumerate(displacements):
-        if np.allclose(R_latt, 0):
-            r0_idx = idx
-            break
-
-    # Accumulate bare Bloch sums (without phase_ap)
+    # Bare Bloch sums Σ_R exp(ik·R) r(R) and Σ_R i R_b exp(ik·R) r(R)
     bare_A = {d: np.zeros((norbs, norbs), dtype=complex) for d in labels}
     bare_dA = {d1: {d2: np.zeros((norbs, norbs), dtype=complex)
                     for d2 in labels} for d1 in labels}
 
     for r_idx, R_latt in enumerate(displacements):
-        R_cart = R_latt @ lattice_vectors
+        R_cart = np.asarray(R_latt, dtype=float) @ lattice_vectors
         scalar_phase = np.exp(1j * np.dot(k, R_cart))
 
         for a_idx, a_label in enumerate(labels):
-            r_a = r_matrices[r_idx][a_idx]
-            # For R=0 diagonal: <0n|r̂_a - τ_{n,a}|0n> = 0 exactly.
-            # Zero the diagonal rather than subtracting centres, to avoid
-            # Berry-phase wrapping artifacts in Wannier90's position matrix.
-            if r_idx == r0_idx:
-                r_a = r_a.copy()
-                np.fill_diagonal(r_a, 0.0)
-
-            weighted = r_a * scalar_phase
+            weighted = r_matrices[r_idx][a_idx] * scalar_phase
             bare_A[a_label] += weighted
-
             if need_deriv:
                 for b_idx, b_label in enumerate(labels):
                     bare_dA[a_label][b_label] += 1j * R_cart[b_idx] * weighted
 
-    # Apply atompos phase:
-    #   A_W[a] = phase_ap * bare_A[a]
+    # Apply the intra-cell phase and subtract the centres:
+    #   A_W[a]     = phase_ap * bare_A[a] - diag(tau_a)
     #   dA_W[a][b] = phase_ap * (bare_dA[a][b] + i * ap_b * bare_A[a])
     A_W = {}
     dA_W = {} if need_deriv else None
-    for a_label in labels:
-        A_W[a_label] = phase_ap * bare_A[a_label]
+    for a_idx, a_label in enumerate(labels):
+        A_W[a_label] = phase_ap * bare_A[a_label] - np.diag(tau[:, a_idx])
         if not need_deriv:
             continue
         dA_W[a_label] = {}
@@ -272,3 +310,88 @@ def offdiag_A_H(A_W, psi, dir_chars):
         np.fill_diagonal(mat, 0.0)
         a_H[d] = mat
     return a_H
+
+
+def apply_wannier_correction(A_W, dA_W, psi, rmtx, dir_chars,
+                             vmtx=None, de_mtx=None):
+    """Correct the interband position operator and its generalized derivative.
+
+    Inputs are the bare tight-binding operators in the eigenbasis `psi`:
+    ``rmtx[a] = rbar^a = -i v^a / w`` (off-diagonal), plus the Wannier
+    connection ``(A_W, dA_W)`` from `compute_A_W_k`.  Returns ``(r, corr, v)``:
+
+        r^a          = rbar^a + a^a                     (Eq. 22)
+        v^a_nm       = vbar^a_nm + i w_nm a^a_nm        (n != m; diagonal unchanged)
+        corr^{a;b}   = U† (∂_b A^(W)_a) U
+                       - i [a^a, rbar^b]
+                       - i (ξ^b_nn - ξ^b_mm) (a^a + rbar^a)_nm
+                       - i (ξ^a_nn - ξ^a_mm) rbar^b_nm
+
+    with ``a = offdiag(U† A^(W) U)`` and ``ξ = diag(U† A^(W) U)``.  ``corr``
+    is the piece that must be ADDED to the TB Sipe sum-rule r^{a;b}
+    (`nonlinear_optical._compute_dk_rmtx`) so that the sum is the generalized
+    derivative r^a_{nm;b} = ∂_b r^a_nm - i (ξ^b_nn - ξ^b_mm) r^a_nm of the
+    corrected r, where ξ is the full diagonal Berry connection.
+
+    Derivation.  In the Hamiltonian gauge r = Ā + iD with Ā = U† A^(W) U and
+    D = U† ∂U.  For any M = U† X U the covariant derivative is
+        M_{;b} = U† (∂_b X) U + [M, D^off_b] - i (Ā^b_nn - Ā^b_mm) M_nm ,
+    the diagonal D_nn cancelling identically between ∂_b M and the ξ term.
+    Applied to Ā_a and to iD_a with D^off = -i rbar, and with [Ā, ·] split
+    into its off-diagonal (a) and diagonal (ξ) parts, everything carrying an Ā
+    is collected above; the D-only remainder is the TB Sipe formula.  Each
+    piece satisfies corr_nm^* = corr_mn, as the derivative of a Hermitian
+    operator must.  The previous implementation lacked the factor i on the
+    commutator (making it anti-Hermitian), had the ξ·a term with the opposite
+    sign, and omitted both ξ·rbar terms — see BUG_wannier_r_correction.md.
+
+    The third output is the *physical* velocity, v = i[H, r] with the
+    corrected r, whose interband elements are i w_nm r_nm = vbar_nm + i w_nm
+    a_nm; it is what an engine must use as its current vertex (and anywhere
+    else an interband v_nm stands for i w_nm r_nm), while the bare vbar stays
+    in the Sipe sum rule, the band-energy identities (Delta, inverse mass)
+    and everything else that is a derivative of H(k).  It is returned only
+    when `vmtx` and `de_mtx` (= E_n - E_m) are given, else None.  Every
+    engine output must be independent of the gauge the system was built in
+    (its atompos); `examples/test_wannier_gauge.py` checks that, and it is
+    what fixes which operator goes where.
+
+    Returns ``(rmtx, None, vmtx)`` unchanged when `A_W` is None, so call
+    sites keep a single ``if corr is not None:`` guard.
+    """
+    if A_W is None:
+        return rmtx, None, vmtx
+    if dA_W is None:
+        raise ValueError("apply_wannier_correction needs dA_W; call "
+                         "compute_A_W_k with need_deriv=True")
+
+    A_H = {d: psi.conj().T @ A_W[d] @ psi for d in dir_chars}
+    a_H = {}
+    xid = {}
+    for d in dir_chars:
+        mat = A_H[d].copy()
+        np.fill_diagonal(mat, 0.0)
+        a_H[d] = mat
+        xi = np.diag(A_H[d]).real
+        xid[d] = xi[:, None] - xi[None, :]
+
+    r_new = {d: rmtx[d] + a_H[d] for d in dir_chars}
+
+    corr = {}
+    for a in dir_chars:
+        corr[a] = {}
+        for b in dir_chars:
+            c = psi.conj().T @ dA_W[a][b] @ psi
+            c = c + 1j * (rmtx[b] @ a_H[a] - a_H[a] @ rmtx[b])   # -i [a^a, rbar^b]
+            c = c - 1j * xid[b] * (a_H[a] + rmtx[a])
+            c = c - 1j * xid[a] * rmtx[b]
+            np.fill_diagonal(c, 0.0)
+            corr[a][b] = c
+
+    v_new = None
+    if vmtx is not None:
+        if de_mtx is None:
+            raise ValueError("apply_wannier_correction: de_mtx is required "
+                             "together with vmtx")
+        v_new = {d: vmtx[d] + 1j * de_mtx * a_H[d] for d in dir_chars}
+    return r_new, corr, v_new

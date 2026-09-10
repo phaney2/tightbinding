@@ -1,22 +1,17 @@
 # Tight-Binding Python Code
 
-## ⚠ OPEN BLOCKING BUG — read before running production calculations
+## Wannier-Gauge Correction — RESOLVED 2026-09-10
 
-`compute_A_W_k` (the Wannier-gauge position correction, now
-`calc/wannier_gauge.py`) is **broken**. It makes `delta_Q` complex when it
-must be real, and gives chi^(2) a non-vanishing dissipative part below the
-band gap that survives eta -> 0. Three engines share the one function, so
-**chi^(2), delta_Q and quantum_metric results from Wannier (`_tb.dat`)
-input are all affected** — including any chi^(2)-vs-delta_Q comparison,
-where it contaminates both sides at once.
-
-Full diagnosis, the specific things to check, and the test criteria for a
-fix are in **`BUG_wannier_r_correction.md`**. Do not generate production
-data from Wannier input until this is resolved. Do not treat
-`system.wannier_r: false` as a fix — it is the current *default* precisely
-so the broken term is not silently folded into new results, but it drops a
-physically required term and is a diagnostic, not an answer. See the note
-there.
+The Wannier-gauge position correction (`calc/wannier_gauge.py`) was broken
+from its introduction until 2026-09-10: it made `delta_Q` complex and gave
+chi^(2) an O(1) dissipative part below the gap. `BUG_wannier_r_correction.md`
+now opens with the resolution (five separate defects, what was done, test
+numbers) and keeps the original report as the record. `system.wannier_r`
+defaults to `true` again. **chi^(2), delta_Q and quantum_metric data from
+`_tb.dat` input generated before that date must be regenerated**, and so
+must every *metallic* `chi_ii` from any input (defect 5 there). The
+enforcing test is `examples/test_wannier_gauge.py`; see "Wannier-Gauge
+Position Correction" below for the rules it encodes.
 
 ## Working Style: Docs First
 Read this file (and any PDF/notes the user points to) BEFORE opening source files.
@@ -129,6 +124,15 @@ Common workflow: user provides a PDF with derivations, Claude reads the equation
   yxy, yyx) are machine-zero (1e-13) and chi_yyy = -chi_xxy = -chi_xyx = -chi_yxx exactly.
 - Quantum metric Q, dQ, dQf: match MATLAB to ~1e-12 (predates the periodic-grid change; the
   pointwise agreement is unaffected, but BZ-integrated totals shift by O(1/nk))
+- Wannier-gauge position correction: an exact **gauge-covariance certificate**
+  (`examples/test_wannier_gauge.py`, 41 checks). A point-like multi-atom model re-expressed
+  in another gauge (atompos = 0, or true centres + random offsets) plus the correction must
+  reproduce its atomic-gauge answer: it does, to 1e-13 for r and r^{a;b} and 1e-14 for every
+  engine's per-k output (chi^(2) fast/reference, delta_Q thermal/subspace/band + RTA,
+  quantum_metric Q/dQf); the no-correction control fails by 1-100%. The k-dependent
+  U†(∂A^W)U term is checked against finite differences on the real MoS2 connection at 1e-7
+  (h² convergence). On MoS2 with the correction on: delta_Q real to 1e-9 (thermal), thermal
+  == subspace to 1e-6, sub-gap Re chi^(2) ∝ eta (ratio 0.1275 over an 8x ladder vs 0.125).
 - Gapped graphene / trigonal warping (`examples/honeycomb_warp/`): reproduces the warped-valley
   model of `tmd_warping_note_corrected.pdf` (Eq. 1) and its delta_Q predictions — see below
 
@@ -147,12 +151,24 @@ reproduced MATLAB to 1e-13, which established that MATLAB carries the same three
    negative absorption (Re sigma^(1)_xx < 0 at the interband peak). Now +i eta throughout the
    response denominators. The Souza `eta_sos` regularization of the bare 1/w_nm is untouched.
 
+4. **`chi_ii` band curvature (fixed 2026-09-10).** The second k-derivative of the occupation
+   used the diagonal of ∂²H as ∂_b∂_c E_n, omitting the interband sum rule
+   2 Re Σ_m v_nm v_mn / w_nm — which is also what makes the curvature gauge invariant (found by
+   the gauge-covariance certificate). No effect on insulators, where chi_ii = 0 below the gap;
+   every *metallic* chi_ii before the fix is wrong. Inherited from MATLAB.
+
 **Do not "fix" a MATLAB mismatch in chi^(2) by reverting to MATLAB.** Validate against the
 analytic pole-sum instead. Term-family ratios against the exact result (constant +i / -i / +1
 per family, uniform in frequency and direction) were the diagnostic that found this.
 
 **Consequence:** chi^(2) data generated before `8b5a079` is invalid and must be regenerated, and
 term-decomposition conclusions (chi_ei vs chi_ee balance) re-derived.
+Metallic chi_ii data generated before 2026-09-10 is invalid as well (item 4).
+
+**Output convention.** `chi_total` equals the second-order *conductivity* sigma^{abc}(w; w, 0):
+**Im is the reactive part and Re the dissipative part** (for an insulator below the gap,
+Re → 0 linearly in eta and Im → a constant). Test 2 of the original bug report was written
+the other way round; do not repeat that.
 
 ## Gapped Graphene = Warped Valley Model
 `examples/honeycomb_warp/` implements Eq. 1 of `tmd_warping_note_corrected.pdf`
@@ -358,6 +374,14 @@ calc:
 Uses `_compute_dk_rmtx` (Sipe sum rule) borrowed from `nonlinear_optical.py`. Sign
 convention: code and PDFs use r = -i*v/w; dk_rmtx[c][a] = r^{c;a} (no sign flip).
 
+**Wannier input.** All three formulations use the same corrected position operator: the
+`subspace`/`band` pair integrands and `T_mix` are written in terms of the full interband
+r (their bare part is exactly v·inv_de), and `thermal` was always written in r. With the
+correction on, thermal == subspace to 1e-6 on MoS2 (they disagreed by 10% before 2026-09-10
+because subspace used the bare v/w). The `T_Sipe_*` split — including `T_Sipe_wannier_corr`
+— is gauge-dependent by construction; only the sum is physical. On MoS2 the correction is a
+27% effect on dQ_yyy (+0.090 on -0.336).
+
 **Thermal-path sign.** `delta_Q_metal_finite_T.pdf` derives with H' = +E·r; the engine's
 established convention is H' = -E·r, so the thermal and RTA assemblies carry an overall
 factor of **-1** relative to that note (`_assemble_delta_Q_thermal`, `_assemble_delta_Q_rta`).
@@ -373,56 +397,89 @@ precision; insulator limit == subspace at 2e-16.
 
 **Gotchas for small-gap models.** `eta_sos` defaults to 0.05, which is comparable to (or larger than) the gap in low-energy models — set it to ~1e-8 whenever bands are never degenerate. Also set `eta: 0.0` to compare against unbroadened analytic results, and `kT` well below the gap.
 
-**Position operator gauge.** `bloch.py` builds H(k) in the *atomic gauge*, exp(ik·(R + tau_j - tau_i)) via `atompos`. In that gauge the TBA position operator is exactly r = -i*v/w with zero intra-cell Wannier correction, so `compute_A_W_k` correctly returns None for TB_simple systems even in multi-atom cells (see "Wannier-Gauge Position Correction" below). k·p expansions of `get_H_k` output should therefore be done in the atomic gauge too.
+**Position operator gauge.** `bloch.py` builds H(k) in the *atomic gauge*, exp(ik·(R + tau_j - tau_i)) via `atompos`, for every input: atom coordinates for TB_simple, Wannier centres for `_tb.dat` (always, since 2026-09-10). For point-like orbitals the TBA position operator in that gauge is exactly r = -i*v/w with zero intra-cell term, so `compute_A_W_k` correctly returns None for TB_simple systems even in multi-atom cells; for Wannier functions the finite-spread part is what the correction adds (see "Wannier-Gauge Position Correction" below). k·p expansions of `get_H_k` output should therefore be done in the atomic gauge too.
 
 ## Wannier-Gauge Position Correction (`system.wannier_r`)
 
-One switch, one kernel, in `calc/wannier_gauge.py`. Every engine that builds a position
-operator reads the flag through `resolve_wannier_r(cfg, system, engine)` and gates the
-kernel through `compute_A_W_k(system, k, dir_chars, enabled=...)`. **Add an engine with an
-`r` operator and it must go through both** — that is the whole point of the module.
+One switch, one kernel, one application function, in `calc/wannier_gauge.py`. Every engine
+that builds a position operator reads the flag through `resolve_wannier_r(cfg, system,
+engine)`, builds the connection through `compute_A_W_k(system, k, dir_chars, enabled=...)`,
+and applies it through `apply_wannier_correction(A_W, dA_W, psi, rmtx, dir_chars, vmtx=,
+de_mtx=)`. **Add an engine with an `r` operator and it must go through all three.**
 
 ```yaml
 system:
   wannier_tb: mos2_tb.dat
-  wannier_r: false        # <- here. NOT under calc:
+  wannier_centres: mos2_centres.xyz   # recommended — see the loader note
+  wannier_r: true         # <- here, NOT under calc:  (default)
 ```
 
-| engine | uses it |
-|---|---|
-| `nonlinear_optical` (+ `_fast`) | Eq. 22 on `r`, Eq. 36 on `r^{a;b}` |
-| `delta_Q` | same, via the same kernel |
-| `quantum_metric` | Eq. 22 on `r`; Q, dQ and dQf all go through `_rr_sum` |
-| `bands`, `all_ek`, `jdos` | no position operator; `main._dispatch` notes the key is unused |
+**What the kernel computes.** In the gauge `bloch.py` uses (Bloch phases with the centres
+tau from `atompos`), the Wannier-gauge Berry connection is
 
-**Default is `False` and that is deliberately wrong.** `WANNIER_R_DEFAULT` in
-`wannier_gauge.py` is the diagnostic setting, chosen so the defective correction is not
-silently folded into new results while `BUG_wannier_r_correction.md` is open. Restore it
-to `True` when that bug closes — the `TODO` is on the constant. On a system that actually
-carries `wannier_r_matrices` the engine warns at *both* settings, because neither is
-currently trustworthy.
+    A^W_{nm,a}(k) = Σ_R exp(ik·(R + tau_m - tau_n)) <0n|r_a|Rm>  -  tau_{n,a} δ_nm
 
-**No-op cases.** `build_system` models and `_hr.dat` input carry no position matrices, so
-the flag changes nothing there — the run banner says `(inert: ...)` rather than leaving it
-ambiguous. Only `_tb.dat` input (the TMD set) is affected.
+Eq. 20 of arXiv:1804.04030 is the tau = 0 case. The subtracted centres are *derived from
+`atompos`*, so H(k) and A^W(k) are in one gauge by construction. For point-like orbitals at
+tau the sum is exactly tau_n δ_nm and A^W = 0.
 
-**Errors, not silent drops.** `calc.wannier_r` raises (it lived there, for `delta_Q` only,
-before the unification); a non-boolean value raises. `config.load_config` runs the same
-validator, so YAML mistakes fail at load.
+**What gets corrected, and what must not be.** With Ā = U†A^W U, a = offdiag(Ā),
+ξ = diag(Ā), rbar = -i v/w:
 
-**Two known gaps, both documented rather than fixed:**
-- `calc.method: projector` rebuilds `chi_e1`/`chi_e2` from `H(k)` projectors, which carry
-  no correction — those two terms are effectively `wannier_r=False` regardless of the flag.
-  The engine prints a note. Both are unphysical and excluded from `chi_total`.
-- `_process_kpoint_fast(_k_data=...)` bypasses the Phase-1 operator build entirely, so the
-  flag has no effect on that path.
+| operator | corrected form | used by |
+|---|---|---|
+| interband r | rbar + a (Eq. 22) | every engine |
+| generalized derivative r^{a;b} | TB Sipe sum rule + U†(∂_b A^W_a)U − i[a_a, rbar_b] − i(ξ^b_nn−ξ^b_mm)(a^a+rbar^a) − i(ξ^a_nn−ξ^a_mm) rbar^b | chi^(2), delta_Q |
+| current vertex v (interband) | vbar_nm + i w_nm a_nm  (v = i[H, r] with the full r) | chi^(2) |
+| projector-derivative factors v/w | i r (full) | delta_Q subspace/band |
+| perturbation vertex | full r | quantum_metric |
+| Delta = v_nn − v_mm, band curvature, inverse mass, the Sipe sum rule's own v's | **bare** v | all |
 
-**Regression status of the unification:** `input_qm_test.yaml`, `input_nonlinear_test.yaml`
-and `input_delta_Q_test.yaml` are **bit-identical** before and after. `quantum_metric`'s
-`_rr_sum` keeps the leading term in its original factor order specifically to achieve that;
-`dQ` amplifies a 1-ulp reassociation by `|Q|/(delta*|dQ|)` ~ 1e8 where `dQ` is small.
-Tests: `examples/test_wannier_r_flag.py` (31 checks, incl. a synthetic `_tb.dat`-like
-system so the correction is actually exercised on a machine with no Wannier files).
+The rule that decides the table: **every engine output must be independent of the gauge the
+system was built in**. `examples/test_wannier_gauge.py` enforces exactly that (see Validated
+Benchmarks). The previous implementation had the commutator without its factor of i, the
+ξ·a term with the wrong sign, the ξ·rbar terms missing, and corrected r but not v — the
+subject of `BUG_wannier_r_correction.md`.
+
+**The loader (`wannier.build_system_from_tb`)** conditions the `_tb.dat` position blocks
+before storing them, printing one diagnostic line (two if it had to repair something):
+- symmetrizes r(R) ← ½[r(R) + r(−R)†] (Wannier90 writes the finite-difference Eq. 44 of
+  Wang et al. raw; `postw90` Hermitianizes too);
+- always builds `atompos` from the Wannier centres — the `_centres.xyz` file if given, else
+  the band-diagonal of the R=0 block — so `_tb.dat` input runs in the atomic gauge;
+- compares that diagonal with the centres and replaces it where they differ. The file's
+  <0n|r|0n> comes from a Berry-phase log and can be wrapped by a lattice vector or scrambled
+  outright when a centre sits on the branch cut (the MoS2 file: Mo at z = c/2 with one
+  k-point along c, so its z entries are garbage while x, y are fine). The band-diagonal
+  R≠0 elements of such a component come from the same log: **do not use the z position
+  operator from that file.** Pass the centres file; it is not optional in practice.
+
+**Default is `True`.** `False` is the point-like-orbital approximation r = -i v/w in the
+atomic gauge, a diagnostic; both settings print a one-line note. TB_simple and `_hr.dat`
+input carry no position matrices, so the flag is inert there (the banner says so).
+
+**Errors, not silent drops.** `calc.wannier_r` raises (it lived there before the switch was
+unified); a non-boolean value raises. `config.load_config` runs the same validator.
+
+**Known gaps, documented rather than fixed:**
+- `quantum_metric`'s finite-difference `dQ` perturbs the states with the full r but is a
+  bare-velocity heuristic overall and is **not gauge-covariant** with the correction on (17%
+  on the test models); `Q` and `dQf` are. The engine prints a note. Use `calc.type: delta_Q`.
+- The Souza `eta_sos` regularization acts on the bare -i v/w only, so results are
+  gauge-covariant only to O(eta_sos²/w²) × (intra-cell term) near degeneracies — one more
+  reason the atomic gauge is now the only gauge `_tb.dat` input runs in.
+- `calc.method: projector` rebuilds `chi_e1`/`chi_e2` from H(k) projectors, which carry no
+  correction; both are unphysical and excluded from `chi_total`. The engine prints a note.
+- `_process_kpoint_fast(_k_data=...)` bypasses the Phase-1 operator build, so the flag has
+  no effect on that path.
+
+**Regression status.** TB_simple input never enters the correction; `input_qm_test.yaml`,
+`input_nonlinear_test.yaml` and `input_delta_Q_test.yaml` are **bit-identical** to the
+pre-fix code. `_tb.dat` results change (that is the point); `wannier_r: false` results on
+`_tb.dat` input *without* a centres file change too, because they were in the lattice
+gauge before. Tests: `examples/test_wannier_gauge.py` (the certificates; pass the MoS2
+directory as argv[1] to include the real-data section) and
+`examples/test_wannier_r_flag.py` (31 checks on the switch itself).
 
 ## MATLAB Source Reference
 The original MATLAB code (`master_response`) is the reference when porting and validating.

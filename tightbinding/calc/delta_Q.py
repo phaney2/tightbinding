@@ -73,7 +73,8 @@ from ..bloch import get_H_v, get_reciprocal_lattice, diagonalize_hk
 from ..types import System
 from .. import parallel
 from .wannier_gauge import (
-    WANNIER_R_DEFAULT, compute_A_W_k, resolve_wannier_r,
+    WANNIER_R_DEFAULT, apply_wannier_correction, compute_A_W_k,
+    resolve_wannier_r,
 )
 
 
@@ -445,56 +446,21 @@ def _process_kpoint(system, k, dir_chars, ab_pairs, field_dirs,
             # or whether the system carries wannier_r_matrices.
             dk_rmtx_terms[d1][d2]['wannier_corr'] = zero_mat.copy()
 
-    # --- Wannier-gauge position-operator corrections (arXiv:1804.04030) ---
-    # Mirror the chi2 implementation in nonlinear_optical.py: the bare
-    # r = -i v/w (TBA form) is corrected by the off-diagonal Berry
-    # connection a^(H)_{nm} = A^(H)_{nm} (Eq. 22), and the bare Sipe
-    # dk_rmtx acquires a three-part correction (Eq. 36).
+    # --- Wannier-gauge position correction (calc/wannier_gauge.py) ---
+    # Eq. 22 on r, and the covariant-derivative correction on r^{a;b}, which
+    # is registered as the 'wannier_corr' Sipe sub-term so the sub-terms still
+    # sum exactly to dk_rmtx.  Both are (None-guarded) no-ops when the flag is
+    # off or the system carries no position matrices.  The bare vmtx is kept:
+    # its only uses from here on are band-energy identities (Delta, the RTA
+    # inverse-mass sum rule); every interband position factor in the
+    # assemblies is built from rmtx.
     A_W, dA_W = compute_A_W_k(system, k, dir_chars, enabled=wannier_r)
-
-    if A_W is not None:
-        # Rotate Wannier-gauge connection into the Hamiltonian gauge.
-        A_H = {d: psi.conj().T @ A_W[d] @ psi for d in dir_chars}
-
-        # Off-diagonal part a_{nm} = A^(H)_{nm} for n != m.
-        a_H = {}
-        for d in dir_chars:
-            a_H[d] = A_H[d].copy()
-            np.fill_diagonal(a_H[d], 0.0)
-
-        # Save pre-correction (TBA-only) rmtx for use inside the Eq. 36
-        # commutator term, then apply Eq. 22 to the stored rmtx.
-        r_bar = {d: rmtx[d].copy() for d in dir_chars}
-        for d in dir_chars:
-            rmtx[d] = rmtx[d] + a_H[d]
-
-        # Rotate dA_W and pull out the diagonal Berry connection
-        # xi_nn^d = A^(H)_{nn,d}.real.
-        dA_H = {}
-        for d1 in dir_chars:
-            dA_H[d1] = {}
-            for d2 in dir_chars:
-                dA_H[d1][d2] = psi.conj().T @ dA_W[d1][d2] @ psi
-        xi_diag = {d: np.diag(A_H[d]).real.copy() for d in dir_chars}
-
-        # Eq. 36 three-part correction to the generalized derivative.
+    rmtx, corr, _ = apply_wannier_correction(A_W, dA_W, psi, rmtx, dir_chars)
+    if corr is not None:
         for d1 in dir_chars:
             for d2 in dir_chars:
-                # Part A: ordinary k-derivative of a^(H) (diagonal zeroed).
-                corr = dA_H[d1][d2].copy()
-                np.fill_diagonal(corr, 0.0)
-
-                # Part B: connection ("covariant") commutator with r_bar.
-                corr = corr + r_bar[d2] @ a_H[d1] - a_H[d1] @ r_bar[d2]
-
-                # Part C: diagonal Berry-connection difference.
-                xi_diff = xi_diag[d2][:, None] - xi_diag[d2][None, :]
-                corr = corr + 1j * xi_diff * a_H[d1]
-
-                np.fill_diagonal(corr, 0.0)
-
-                dk_rmtx[d1][d2] = dk_rmtx[d1][d2] + corr
-                dk_rmtx_terms[d1][d2]['wannier_corr'] = corr
+                dk_rmtx[d1][d2] = dk_rmtx[d1][d2] + corr[d1][d2]
+                dk_rmtx_terms[d1][d2]['wannier_corr'] = corr[d1][d2]
 
     TERM_NAMES = _term_names(formulation)
 
@@ -605,14 +571,25 @@ def _compute_pair_matrices(vmtx, rmtx, dk_rmtx_terms, Delta,
     pair matrices with a different outer mask: f_p(1-f_q) on both axes.
 
     Sign / iη conventions match Eq. 40: Trace-II pieces carry +iη
-    (inv_de_p), Trace-III pieces carry -iη (inv_de_m); all projector-
-    derivative factors are bare (inv_de, Souza-regularized).
+    (inv_de_p), Trace-III pieces carry -iη (inv_de_m).  The projector-
+    derivative factors v/ω are written as i r with the FULL interband r
+    (rmtx, Wannier-corrected when the flag is on): for the bare part this
+    is exactly v·inv_de (Souza-regularized), and the smooth a^(H) part is
+    added unregularized, as in the thermal assembly.  `vmtx` is unused
+    (kept in the signature); Delta carries the diagonal velocities.
     """
+    del vmtx
     sipe_ca = dk_rmtx_terms[c][a]
     sipe_cb = dk_rmtx_terms[c][b]
 
-    common_p = vmtx[b].T * inv_de_p * inv_de   # Trace II denominator
-    common_m = vmtx[a] * inv_de * inv_de_m     # Trace III denominator
+    # i r^a = v^a inv_de for the bare operator; transposed partner uses the
+    # antisymmetry of inv_de: v^b.T inv_de = -(v^b inv_de).T.
+    V_a = 1j * rmtx[a]
+    V_b = 1j * rmtx[b]
+    Vt_b = -V_b.T
+
+    common_p = Vt_b * inv_de_p                 # Trace II denominator
+    common_m = V_a * inv_de_m                  # Trace III denominator
 
     pair = {}
     for sub, term in (('delta', 'T_Sipe_Delta'),
@@ -624,16 +601,16 @@ def _compute_pair_matrices(vmtx, rmtx, dk_rmtx_terms, Delta,
 
     # Velocity-difference (PDF D^a_{mn} = -Delta_code[a][n,m]).
     pair['T_Delta'] = (
-        rmtx[c] * (-Delta[a]) * vmtx[b].T * inv_de_p**2 * inv_de
-        + vmtx[a] * rmtx[c].T * (-Delta[b]) * inv_de * inv_de_m**2
+        rmtx[c] * (-Delta[a]) * Vt_b * inv_de_p**2
+        + V_a * rmtx[c].T * (-Delta[b]) * inv_de_m**2
     )
 
     # Explicit three-band (inner sum over all intermediate bands l).
-    M_A = (rmtx[c] * inv_de_p) @ (vmtx[a] * inv_de)
-    M_B = ((vmtx[b] * inv_de) @ (rmtx[c] * inv_de_p)).T
+    M_A = (rmtx[c] * inv_de_p) @ V_a
+    M_B = (V_b @ (rmtx[c] * inv_de_p)).T
     pair['T_3band'] = (
-        M_A * vmtx[b].T * inv_de
-        + (vmtx[a] * inv_de) * M_B
+        M_A * Vt_b
+        + V_a * M_B
     )
 
     return pair
@@ -649,8 +626,8 @@ def _assemble_delta_Q(vmtx, rmtx, dk_rmtx, dk_rmtx_terms, Delta,
 
     Implements Eq. 40 of revised_formula_sheet_eta.pdf.  The broadened
     denominators inv_de_p = 1/(w+iη) and inv_de_m = 1/(w-iη) enter only
-    the DC perturbation factors; projector-derivative denominators (v/w)
-    use bare inv_de.
+    the DC perturbation factors; projector-derivative factors (v/w) are
+    i r with the full interband r (bare part: Souza inv_de).
 
     Code conventions: rmtx = r (PDF Eq. 6), dk_rmtx[c][a] = r^{c;a} (PDF),
     Delta_code[a][n,m] = v^a_{nn} - v^a_{mm} = -D^a_{mn} (PDF Eq. 2).
@@ -717,31 +694,36 @@ def _compute_T_mix_pair(vmtx, rmtx, inv_de, inv_de_p, inv_de_m, a, b, c, f):
 
     iη conventions mirror the band-sum code: the 'adiabatic' c_{pn}
     coefficients carry +iη (inv_de_p), their complex conjugates
-    c^*_{qn} carry -iη (inv_de_m), and the bare v/ω factors use
-    Souza-regularized inv_de.
+    c^*_{qn} carry -iη (inv_de_m).  The v/ω factors are i r with the FULL
+    interband r (see `_compute_pair_matrices`); `vmtx` is unused.
     """
+    del vmtx
     f_row = f[None, :]  # broadcast weight over inner index
+
+    # i r^a == v^a inv_de (bare part exactly); v^a inv_de.T == -(i r^a).
+    R_a = 1j * rmtx[a]
+    R_b = 1j * rmtx[b]
 
     # c_{·,n}^{(+iη)}-like factor as an (outer, n) matrix, weighted by f_n.
     M_rc = rmtx[c] * inv_de_p.T * f_row      # elem = f_n r^c[·,n] / (ω_{n,·}+iη)
     # v^a_{·,n}/ω_{n,·} factor, f_n-weighted.
-    M_va = vmtx[a] * inv_de.T * f_row        # elem = f_n v^a[·,n] / ω_{n,·}
-    M_vb = vmtx[b] * inv_de.T * f_row        # elem = f_n v^b[·,n] / ω_{n,·}
+    M_va = -R_a * f_row                      # elem = f_n v^a[·,n] / ω_{n,·}
+    M_vb = -R_b * f_row                      # elem = f_n v^b[·,n] / ω_{n,·}
 
     # Right-side partners (inner→end matrices, not weighted).
-    N_va = vmtx[a] * inv_de                  # elem = v^a[n,·] / ω_{n,·}
-    N_vb = vmtx[b] * inv_de                  # elem = v^b[n,·] / ω_{n,·}
+    N_va = R_a                               # elem = v^a[n,·] / ω_{n,·}
+    N_vb = R_b                               # elem = v^b[n,·] / ω_{n,·}
     N_rc_m = rmtx[c] * inv_de_m              # elem = r^c[n,·] / (ω_{n,·}-iη)
 
     # II_mix[j,l] = -{(M_rc @ N_va)[j,l] + (M_va @ N_rc_m)[j,l]}
     #              * v^b[l,j]/ω_{lj}
     inner_II = M_rc @ N_va + M_va @ N_rc_m
-    mix_II = -inner_II * vmtx[b].T * inv_de.T
+    mix_II = -inner_II * R_b.T
 
     # III_mix[j,l] = + v^a[j,l]/ω_{jl}
     #               * {(M_rc @ N_vb)[l,j] + (M_vb @ N_rc_m)[l,j]}
     inner_III_lj = M_rc @ N_vb + M_vb @ N_rc_m  # indexed as (l, j)
-    mix_III = vmtx[a] * inv_de * inner_III_lj.T
+    mix_III = R_a * inner_III_lj.T
 
     return mix_II + mix_III
 

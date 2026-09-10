@@ -1,7 +1,194 @@
 # BUG: Wannier-gauge position correction `_compute_A_W_k`
 
-**Status:** open, blocking. Found 2026-08-25 while validating the
-chi^(2) <-> static-field quantum-geometry relation on MoS2.
+**Status:** RESOLVED 2026-09-10. Found 2026-08-25 while validating the
+chi^(2) <-> static-field quantum-geometry relation on MoS2. The original
+report is kept below, unchanged, as the record; the resolution comes first.
+
+---
+
+## Resolution (2026-09-10)
+
+### What was actually wrong
+
+Five separate defects, not one. The original report's checklist item 3
+("the derivative `dA_W`") was fine; items 1, 2 and 4 each turned out to be
+real but not in the way guessed.
+
+1. **The Eq. 36 assembly at the call sites was wrong** (not the kernel).
+   `nonlinear_optical.py`, `nonlinear_optical_fast.py` and `delta_Q.py`
+   each carried the same copy-pasted block. The covariant derivative of the
+   corrected r = Abar + iD is, with a = offdiag(Abar), xi = diag(Abar),
+   rbar = -i v/w:
+
+       corr^{a;b} = U^dag(d_b A^W_a)U - i[a_a, rbar_b]
+                    - i(xi^b_nn - xi^b_mm)(a^a + rbar^a)_nm
+                    - i(xi^a_nn - xi^a_mm) rbar^b_nm
+
+   The code had the commutator WITHOUT the factor i (anti-Hermitian, and on
+   MoS2 five times larger than its Hermitian part — this is the complex
+   delta_Q), the xi.a term with the opposite sign, and both xi.rbar terms
+   missing. Proven by an exact gauge-covariance certificate (below), not by
+   comparison to a reference number.
+2. **Only r was corrected; the velocity was not.** The physical current
+   vertex is v = i[H, r] with the full r, i.e. v_nm = vbar_nm + i w_nm a_nm.
+   chi^(2) used the bare v as its output vertex, the `subspace`/`band`
+   delta_Q formulations used bare v/w as projector-derivative factors, and
+   quantum_metric perturbed its states with the bare v. Only the `thermal`
+   delta_Q path (written in terms of r throughout) was consistent — which is
+   why `thermal` and `subspace` disagreed by 10% on MoS2 with the correction
+   on, and agree to 1e-6 now.
+3. **The `_tb.dat` position blocks are not Hermitian-paired.** Wannier90's
+   `write_tb` writes Eq. 44 of Wang et al. raw; `postw90` takes the
+   Hermitian part before use (`get_oper.F90`, with a comment saying why).
+   On `mos2_tb.dat` |r(R) - r(-R)^dag| reaches 1.3e-2 A, so A^W(k) was
+   non-Hermitian at 4e-2 A. The loader now symmetrizes.
+4. **The R=0 diagonal handling assumed atompos == centres.** Zeroing that
+   diagonal is right only in the atomic gauge with atompos built from the
+   true centres. Without a centres file the Bloch sum ran in the lattice
+   gauge and the required tau_n d_nm term was dropped — an error of
+   offdiag(U^dag tau U) ~ 0.5 A in-plane on MoS2, the size of the genuine
+   correction. Worse, the file's R=0 diagonal itself is unreliable in z for
+   this MoS2 (top-S entries wrapped by one lattice vector; the five Mo-like
+   entries scrambled by the Berry-phase branch cut, because Mo sits at
+   z = c/2 with one k-point along c). The loader now always builds atompos
+   from the centres (file if given, else the R=0 diagonal), compares the
+   two, repairs the diagonal, and warns naming the affected component.
+5. **`chi_ii` used the diagonal of d^2H as the band curvature.** Found by
+   the same certificate, unrelated to Wannier input: d_b d_c E_n needs the
+   interband sum rule 2 Re sum_m v_nm v_mn / w_nm, which is also what makes
+   it gauge invariant. Invisible in insulators (chi_ii = 0 below the gap);
+   wrong for every metallic chi_ii computed before, in any input format.
+   Inherited from the MATLAB original.
+
+### What was done
+
+- `calc/wannier_gauge.py`: `compute_A_W_k` subtracts the centres implied
+  by `atompos` (so the connection and H(k) are in one gauge by
+  construction, whatever that gauge is); new `apply_wannier_correction`
+  returns the corrected r, the r^{a;b} piece AND the corrected velocity,
+  and is the only place the algebra lives. `WANNIER_R_DEFAULT = True`.
+- `wannier.py`: `build_system_from_tb` Hermitian-pairs the position blocks,
+  repairs the R=0 diagonal against the centres, always builds atompos from
+  the centres, prints one diagnostic line (two if the diagonal was bad).
+- The three chi^(2)/delta_Q call sites call the helper; chi^(2) uses the
+  corrected velocity as its current vertex; `delta_Q`'s `subspace`/`band`
+  pair integrands are written in terms of the full r; `quantum_metric`
+  perturbs with the full r; `chi_ii` uses the sum-rule curvature.
+- `examples/test_wannier_gauge.py` (new, 41 checks). The key idea: a
+  multi-atom TB_simple model has point-like orbitals, so its atomic-gauge
+  r and r^{a;b} are exact with no correction. Re-express the SAME model
+  with a different atompos (zero, or the true centres plus random offsets):
+  A^W is then a known diagonal, and the corrected operators — and every
+  engine's per-k output — must reproduce the atomic-gauge answer. They do,
+  to 1e-13 at the operator level and 1e-14 at the engine level; the
+  no-correction control fails by 1% to 100%. A finite-difference certificate
+  with a k-dependent A^W (synthetic, and the real MoS2 connection) checks
+  the U^dag(dA^W)U term at 1e-7, converging as h^2.
+
+### Test results (MoS2, `mos2_tb.dat` + `mos2_centres.xyz`)
+
+**Test 1 — delta_Q real.** nk=200, Ef=-0.030102, kT=eta=eta_sos=0.025,
+`subspace` (the report's setup; HEAD baseline reproduces the report bit
+for bit):
+
+| | dQ_yyy | dQ_xxy | Im/Re (yyy) |
+|---|---|---|---|
+| baseline, wannier_r=True | -0.533203 -0.199584j | +0.542321 +0.203721j | 0.374 |
+| fixed, wannier_r=True, subspace | -0.335564 +0.000000j | +0.333092 -0.000000j | 4e-18 |
+| fixed, wannier_r=True, thermal | -0.335563 -0.000000j | +0.333091 +0.000000j | 3e-18 |
+| fixed, wannier_r=False (point-like) | -0.357861 | +0.317245 | 3e-18 |
+
+PASS. In the default `thermal` formulation every one of the 8 components is
+real to <= 1e-9 relative (the 1e-9 is on xyx = 0.3269; the two components
+that are ~1e-3 of the others sit at 8e-6). `subspace` keeps a 2e-4 relative
+imaginary part on xyx/yxx that is also there with the correction OFF: an
+eta = 0.025 artefact of the T=0 formulation, not this bug. The correction
+is +0.090 on a total of -0.336 (T_Sipe_wannier_corr), i.e. a 27% effect —
+it is not small, as the report anticipated. The D3h chain
+yyy = -xxy = -xyx = -yxx holds to 2.6% (thermal), inside the 3.5% floor of
+this unsymmetrized Hamiltonian; `subspace` was at 12% before the vertex fix
+and is at 2.6% now.
+
+**Test 2 — sub-gap dissipation.** nk=300, all 27 abc, eta ladder
+0.05 -> 0.00625, S = sum_abc chi_total. **The criterion in the original
+report used the wrong component.** `chi_total` is the second-order
+conductivity (it matches sigma^{abc}(w; w, 0) at ratio +1), so as CLAUDE.md
+says under "Frequency-Integrated chi^(2)": Im is the reactive part and Re
+the dissipative one. Read that way:
+
+| omega | Re S at eta=0.05 -> 0.00625 (ratio; pure broadening 0.125) | Im S (ratio) | Re/Im at 0.00625 | 2eta/w + eta/(gap-w) |
+|---|---|---|---|---|
+| 0.05 | 1.068 -> 0.136 (0.1275) | -0.548 (1.004) | 0.25 | 0.25 |
+| 0.30 | 1.109 -> 0.141 (0.1275) | -3.337 (1.004) | 0.042 | 0.046 |
+| 0.60 | 1.247 -> 0.159 (0.1274) | -6.996 (1.004) | 0.023 | 0.026 |
+| 1.00 | 1.662 -> 0.211 (0.1272) | -13.14 (1.006) | 0.016 | 0.021 |
+
+PASS: the dissipative part scales linearly in eta at every omega and is
+quantitatively the eta in the 1/(w + i eta), 1/(w + 2i eta) and interband
+denominators; the reactive part converges to an eta-independent value.
+(The `2eta/w` piece is the omega ~ eta crossover discussed in the
+frequency-integral section; at w = 0.05 and eta = 0.00625 it is 0.25 and
+dominates.) The old code's failure, restated in the right component, is in
+the table under "Baseline comparison" below.
+
+**Test 3 — regressions.** `test_wannier_r_flag.py` (31), `test_dQ_thermal.py`
+(19), `test_freq_integral.py` incl. the sampled-mode comparison against a
+HEAD worktree (0.0), `honeycomb_warp/check_eq13.py` (ratio -1.000000
+unchanged), and the three benchmark configs bit-identical to HEAD.
+TB_simple input never enters the correction, so nothing changes there
+except metallic `chi_ii` (item 5) — the benchmark chi^(2) config sits in a
+gap and is unchanged.
+
+**Test 4 — `chi_ee1`.** Its reactive (Im) part varies 12% across the
+ladder at w = 0.05 and 0.6% at w = 1.0; that is the 2eta/w crossover
+(2eta/w = 2 at the top of the ladder), not a defect. No separate item.
+
+### What changed for users
+
+- `system.wannier_r` defaults to **true** again. `false` is the point-like-
+  orbital approximation, in the atomic gauge; both settings print a note.
+- `_tb.dat` input is now always in the atomic gauge, so `wannier_r: false`
+  results on `_tb.dat` input WITHOUT a centres file change (they were in
+  the lattice gauge before, missing the intra-cell term). With a centres
+  file they are unchanged.
+- Pass `wannier_centres` for `_tb.dat` input: the file's own R=0 diagonal
+  can be wrapped or scrambled (it is, in z, for this MoS2), and the loader
+  tells you when it had to repair it. Do not use the z position operator
+  from this MoS2 file.
+- `delta_Q` `subspace`/`band` and `quantum_metric` results with the
+  correction on change (item 2). `thermal` changes only through item 1.
+- `quantum_metric`'s finite-difference `dQ` is a bare-velocity heuristic and
+  is NOT gauge-covariant with the correction on (17% on the test models);
+  `Q` and `dQf` are. The engine prints a note; use `calc.type: delta_Q`.
+- The Sipe sub-term split (`T_Sipe_*`, `chi_ei*_sipe_*`) is gauge-dependent
+  by construction — only the sums are physical. Do not compare sub-terms
+  across gauges or read physics into `T_Sipe_wannier_corr` alone.
+- The Souza `eta_sos` regularization acts on the bare -i v/w only, so it is
+  not gauge-covariant near a degeneracy (O(eta_sos^2/w^2) x the intra-cell
+  term); the atomic gauge, where the bare part is the physical point-like
+  operator, is the right place to regularize, which is another reason it is
+  now the only gauge `_tb.dat` input runs in.
+- Metallic `chi_ii` values from before this fix are wrong (item 5).
+
+### Baseline comparison
+
+Same ladder endpoints at nk=100, HEAD baseline vs fixed code, dissipative
+part Re S = sum_abc Re chi_total (the reactive Im S alongside):
+
+| omega | baseline Re S, eta 0.05 -> 0.00625 (ratio) | baseline Im S (ratio) | fixed Re S (ratio) | fixed Im S (ratio) |
+|---|---|---|---|---|
+| 0.05 | -2.730 -> -3.360 (1.23) | -2.807 -> -3.398 (1.21) | 1.071 -> 0.138 (0.129) | -0.5458 -> -0.5479 (1.004) |
+| 0.30 | -2.176 -> -2.847 (1.31) | -3.541 -> -4.104 (1.16) | 1.112 -> 0.143 (0.129) | -3.3235 -> -3.3367 (1.004) |
+| 0.60 | -1.540 -> -2.307 (1.50) | -4.580 -> -5.139 (1.12) | 1.251 -> 0.161 (0.128) | -6.9653 -> -6.9961 (1.004) |
+| 1.00 | -0.428 -> -1.473 (3.44) | -6.557 -> -7.238 (1.10) | 1.666 -> 0.214 (0.128) | -13.065 -> -13.140 (1.006) |
+
+The old code had an O(1) dissipative response below the gap that *grew* as
+eta -> 0, and a reactive part that did not converge either. The fixed code's
+nk=100 and nk=300 values agree to three digits, so these are converged.
+
+---
+
+## Original report (2026-08-25), unchanged
 
 **Location:** `tightbinding/calc/wannier_gauge.py` (`compute_A_W_k`),
 added in commit `1054879` ("Add Wannier-gauge r-correction and

@@ -16,7 +16,9 @@ turns the same code into the frequency-integrated engine.  See
 
 import numpy as np
 
-from .wannier_gauge import WANNIER_R_DEFAULT, compute_A_W_k
+from .wannier_gauge import (
+    WANNIER_R_DEFAULT, apply_wannier_correction, compute_A_W_k,
+)
 
 
 def _build_omega_kernels(de_mtx, omega1list, omega2_val, eta_val,
@@ -161,6 +163,7 @@ def _process_kpoint_fast(
     if _k_data is not None:
         ek, vmtx, vvmtx, rmtx, dk_rmtx, Delta, de_mtx, inv_de = _k_data
         dk_rmtx_terms = None  # not available from cached data
+        vcur = vmtx           # cached operators are taken as given
     else:
         H, S, vtb = get_H_v(system, k, order=2)
         ek, psi = diagonalize_hk(H, S, eigenvectors=True)
@@ -203,50 +206,21 @@ def _process_kpoint_fast(
                     Delta[d1], Delta[d2], de_mtx, inv_de, dim,
                     return_terms=True)
 
-        # --- Wannier position operator corrections (arXiv:1804.04030) ---
+        # --- Wannier-gauge position correction (calc/wannier_gauge.py) ---
+        # Eq. 22 on r, the covariant-derivative correction on r^{a;b} (registered
+        # as the 'wannier_corr' Sipe sub-term so the sub-terms still sum exactly
+        # to dk_rmtx), and the physical velocity v = i[H, r] as the current vertex
+        # used below.  The bare v has already gone into Delta and the Sipe sum
+        # rule, where it belongs.  All no-ops when the flag is off or the system
+        # carries no position matrices.
         A_W, dA_W = compute_A_W_k(system, k, dir_chars, enabled=wannier_r)
-        if A_W is not None:
-            A_H = {}
-            for d in dir_chars:
-                A_H[d] = psi.conj().T @ A_W[d] @ psi
-
-            a_H = {}
-            for d in dir_chars:
-                a_H[d] = A_H[d].copy()
-                np.fill_diagonal(a_H[d], 0.0)
-
-            # Eq. 22: r_nm += a_nm; save internal-only r_bar
-            r_bar = {}
-            for d in dir_chars:
-                r_bar[d] = rmtx[d].copy()
-                rmtx[d] = rmtx[d] + a_H[d]
-
-            dA_H = {}
-            for d1 in dir_chars:
-                dA_H[d1] = {}
-                for d2 in dir_chars:
-                    dA_H[d1][d2] = psi.conj().T @ dA_W[d1][d2] @ psi
-
-            xi_diag = {}
-            for d in dir_chars:
-                xi_diag[d] = np.diag(A_H[d]).real.copy()
-
-            # Eq. 36 corrections to dk_rmtx.  Registered also as a
-            # separate sub-term 'wannier_corr' so the Sipe sub-terms
-            # (delta, d2H, 3band, wannier_corr) sum exactly to
-            # the Wannier-corrected dk_rmtx.
+        rmtx, corr, vcur = apply_wannier_correction(
+            A_W, dA_W, psi, rmtx, dir_chars, vmtx=vmtx, de_mtx=de_mtx)
+        if corr is not None:
             for d1 in dir_chars:
                 for d2 in dir_chars:
-                    corr = dA_H[d1][d2].copy()
-                    np.fill_diagonal(corr, 0.0)
-                    corr += r_bar[d2] @ a_H[d1] - a_H[d1] @ r_bar[d2]
-                    xi_diff = xi_diag[d2][:, None] - xi_diag[d2][None, :]
-                    corr += 1j * xi_diff * a_H[d1]
-                    np.fill_diagonal(corr, 0.0)
-                    dk_rmtx[d1][d2] = dk_rmtx[d1][d2] + corr
-                    if dk_rmtx_terms is not None and d1 in dk_rmtx_terms \
-                            and d2 in dk_rmtx_terms[d1]:
-                        dk_rmtx_terms[d1][d2]['wannier_corr'] = corr
+                    dk_rmtx[d1][d2] = dk_rmtx[d1][d2] + corr[d1][d2]
+                    dk_rmtx_terms[d1][d2]['wannier_corr'] = corr[d1][d2]
 
     # ================================================================
     # Phase 2: Vectorized ef/omega computation
@@ -289,16 +263,21 @@ def _process_kpoint_fast(
     # dk_f_mtx[e, d, n, m] = dk_f[e,d,n] - dk_f[e,d,m]
     dk_f_mtx_all = {d: dk_f_all[d][:, :, None] - dk_f_all[d][:, None, :]
                     for d in dir_chars}  # (E, D, D)
-    # d2k_f[e, d1, d2, n] = vv_diag * de_f + v1*v2*de2_f
-    vv_diag = {}
+    # d2k_f[e, d1, d2, n] = curv * de_f + v1*v2*de2_f, with the band curvature
+    #   curv_n = <n|d1 d2 H|n> + 2 Re sum_m v1_nm v2_mn / w_nm
+    # (Hellmann-Feynman twice).  The diagonal of the second derivative of H
+    # alone is neither the curvature nor gauge invariant; the interband sum
+    # rule completes it (bare v, as for every band-energy identity).
+    curv = {}
     for d1 in dir_chars:
         for d2 in dir_chars:
-            vv_diag[d1+d2] = np.diag(vvmtx[d1+d2])
+            curv[d1+d2] = (np.diag(vvmtx[d1+d2])
+                           + 2.0 * np.real(np.sum(vmtx[d1] * vmtx[d2].T * inv_de, axis=1)))
     d2k_f_all = {}
     for d1 in dir_chars:
         for d2 in dir_chars:
             pair = d1 + d2
-            d2k_f_all[pair] = (vv_diag[pair][None, :] * de_f +
+            d2k_f_all[pair] = (curv[pair][None, :] * de_f +
                                vdiag[d1][None, :] * vdiag[d2][None, :] * de2_f)  # (E, D)
 
     # ================================================================
@@ -314,7 +293,7 @@ def _process_kpoint_fast(
 
     for abc in directions:
         dir_a, dir_b, dir_c = abc
-        va = vmtx[dir_a]  # (D, D)
+        va = vcur[dir_a]  # (D, D) physical current vertex
 
         # ---- chi_ii: intra-intra ----
         # rho_ii is diagonal, depends on ef through d2k_f, omega through scalar denoms

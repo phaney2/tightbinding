@@ -230,41 +230,53 @@ The `_tb.dat` format is produced by Wannier90 with `write_tb = .true.` in the `.
 
 **Notes:**
 - When using `wannier_tb`, the `lattice_vectors` key is optional — if omitted, the lattice vectors are read from the file. If provided, the config value is ignored and the file's lattice vectors are used.
-- The `wannier_centres` option provides Wannier function centre positions for building the intra-cell displacement matrices needed by velocity operators. Without it, all Wannier functions are treated as located at the origin.
+- Pass `wannier_centres` for `_tb.dat` input. The Wannier centres set the intra-cell
+  displacements of the Bloch phases (the atomic gauge), and the loader builds them from the
+  file's own R=0 position diagonal when no centres file is given — but that diagonal comes
+  from a Berry-phase log and can be wrapped by a lattice vector or scrambled when a centre
+  sits on the branch cut. The loader compares the two, repairs the diagonal, and warns
+  naming the affected component; with the file it has something to compare against.
+- The position blocks are Hermitian-paired on load (Wannier90 writes them raw; `postw90`
+  does the same symmetrization) and the maximum asymmetry found is printed.
 
 #### `wannier_r` — the Wannier-gauge position correction
 
 ```yaml
 system:
   wannier_tb: path/to/MoS2_tb.dat
-  wannier_r: false        # default; see below
+  wannier_centres: path/to/MoS2_centres.xyz
+  wannier_r: true         # default
 ```
 
-A `_tb.dat` Hamiltonian is **not** in the atomic gauge, so the tight-binding
-form `r = -i v/ω` is incomplete — the intra-cell part of the position operator
-has to be added back from the position matrices the file carries. `wannier_r`
-switches that correction on and off for every engine that builds an `r`
-operator: `nonlinear_optical`, `delta_Q` and `quantum_metric`. One key, one
-meaning, all three engines.
+Wannier functions have a finite spread and off-diagonal dipoles, so the
+tight-binding form `r = -i v/ω` (exact for point-like orbitals) misses part
+of the position operator. `_tb.dat` carries the matrix elements `<0n|r|Rm>`
+that supply it; `wannier_r` switches that correction on and off for every
+engine that builds an `r` operator: `nonlinear_optical`, `delta_Q` and
+`quantum_metric`. One key, one meaning, all three engines. It corrects the
+interband `r`, its generalized derivative `r^{a;b}`, and the current vertex
+consistently, and the whole thing is checked by an exact gauge-covariance
+test (`examples/test_wannier_gauge.py`).
 
-> ⚠️ **The default is `false`, and that is not the physically correct value.**
-> The correction is genuinely required for Wannier input, but the function that
-> computes it is currently defective — see `BUG_wannier_r_correction.md`. Until
-> that is fixed neither setting gives a trustworthy answer on `_tb.dat` input,
-> which is why the code warns at *both* settings. `false` is the diagnostic
-> value, chosen so the broken term is not silently folded into new results;
-> it is not a fix. The default returns to `true` when the bug closes.
+`false` keeps the point-like-orbital approximation (in the atomic gauge, so
+the intra-cell phases are still right). It is a diagnostic setting; both
+settings print a one-line note. The correction is not small: on MoS2 it is a
+27% effect on `delta_Q`.
 
 The flag is a **no-op** for models built from YAML (`lattice_type`/`positions`)
-and for `_hr.dat` input, neither of which carries position matrices: `bloch.py`
-builds those Hamiltonians in the atomic gauge, where `r = -i v/ω` is exact. The
-code says so in the run banner rather than leaving you guessing.
+and for `_hr.dat` input, neither of which carries position matrices. The
+run banner says so rather than leaving you guessing.
 
 Two errors worth knowing about:
 - `calc.wannier_r` is rejected — the key used to live there (for `delta_Q`
   only) and moved to `system:` when the switch was unified. Move it.
 - The value must be a YAML boolean; `wannier_r: "true"` is rejected rather
   than silently read as truthy.
+
+One caveat: `quantum_metric`'s finite-difference `dQ` is a bare-velocity
+heuristic that is not gauge-covariant with the correction on (its `Q` and
+`dQf` are); the engine prints a note. Use `calc.type: delta_Q` for the
+field-induced change.
 
 ---
 
@@ -353,6 +365,11 @@ calc:
 
 Each direction string `'abc'` specifies the three Cartesian indices of χ^(2). Common choices:
 - `'xzx'`, `'zxx'` — relevant for 2D systems with broken z-mirror symmetry
+
+**Convention.** `chi_total` is the second-order *conductivity*
+σ^{abc}(ω; ω, 0): its imaginary part is the reactive response and its real
+part the dissipative one (below the gap of an insulator, Re → 0 linearly in
+η and Im → a constant).
 
 **Output:**
 - `.npz` file with all 14 chi components for each direction triplet
@@ -487,10 +504,11 @@ calc:
 ```
 
 All three quantities are quadratic forms in the interband position operator, so
-they respect [`system.wannier_r`](#wannier_r--the-wannier-gauge-position-correction)
-exactly as `delta_Q` does. Before that switch was unified this engine was
-pinned at the uncorrected form while its own DC response `delta_Q` used the
-corrected one, which put Q and dQ on opposite sides of the correction.
+they respect [`system.wannier_r`](#wannier_r--the-wannier-gauge-position-correction).
+`Q` and `dQf` use the corrected operator consistently and are gauge-covariant;
+the finite-difference `dQ` perturbs the states with a bare-velocity scheme and
+is **not** (the engine prints a note when the correction is on). Use
+`calc.type: delta_Q` for the field-induced change of the metric on Wannier input.
 
 **Output:**
 - `.npz` file with Q, dQ, dQf tensors
@@ -521,12 +539,10 @@ finite temperature** (reference: `delta_Q_metal_finite_T.pdf`); the legacy
 `subspace` (T=0 occupied projector) and `band` (band-resolved, adiabatic iη)
 formulations remain available.
 
-> ⚠️ **Read the blocking-bug notice in `CLAUDE.md` before running this on
-> Wannier (`_tb.dat`) input.** `delta_Q` shares the Wannier-gauge position
-> correction with χ^(2) and `quantum_metric`, and that function is currently
-> broken — it makes `delta_Q` complex when it must be real. Systems built from
-> YAML (TB_simple) are unaffected, because the atomic gauge needs no such
-> correction.
+> On Wannier (`_tb.dat`) input the position operator carries the Wannier-gauge
+> correction (`system.wannier_r`, default on); all three formulations use the
+> same corrected operator and agree with each other on insulators. The per-term
+> `T_Sipe_*` split is gauge-dependent by construction — only the sum is physical.
 
 ```yaml
 calc:

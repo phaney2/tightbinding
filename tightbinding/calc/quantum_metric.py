@@ -23,6 +23,7 @@ from ..types import System
 from .. import parallel
 from .wannier_gauge import (
     WANNIER_R_DEFAULT, compute_A_W_k, offdiag_A_H, resolve_wannier_r,
+    system_has_wannier_r,
 )
 
 
@@ -57,6 +58,14 @@ def compute_quantum_metric(system: System, cfg: dict) -> dict:
 
     # Wannier-gauge position correction, shared with chi^(2) and delta_Q.
     wannier_r = resolve_wannier_r(cfg, system, 'quantum_metric')
+    if wannier_r and system_has_wannier_r(system):
+        parallel.print_root(
+            "  [quantum_metric] NOTE: Q and dQf use the corrected position "
+            "operator consistently, but the finite-difference dQ perturbs the "
+            "states with a bare-velocity scheme and is NOT gauge-covariant "
+            "with the correction on (examples/test_wannier_gauge.py).  Use "
+            "calc.type: delta_Q for the field-induced change."
+        )
 
     # Reciprocal lattice vectors
     b1, b2, _b3 = get_reciprocal_lattice(system.unitcell_vectors)
@@ -227,13 +236,30 @@ def _process_kpoint(system, k, params):
     for d in dir_chars:
         vmtx[d] = psi.conj().T @ vtb[d] @ psi
 
+    # --- Position operator, with the Wannier-gauge correction if enabled ---
+    # Only A^(W) is needed here, not its k-derivative: the metric involves r
+    # itself, never the generalized derivative r^{a;b}.
+    #
+    # Masking follows chi^(2)/delta_Q: `nondeg` applies to the 1/w factor
+    # only.  a^(H) is smooth across a degeneracy and is added unmasked (its
+    # diagonal is already zeroed by `offdiag_A_H`).
+    A_W, _ = compute_A_W_k(system, k, dir_chars, enabled=wannier_r,
+                           need_deriv=False)
+    a_H = offdiag_A_H(A_W, psi, dir_chars)
+
     # Perturbed eigenstates: psip = psi + psi * pert, psim = psi - psi * pert
     # pert = i*delta*vmtx / (de * (de + i*eta))  [zero for degenerate pairs]
+    #      = -delta * rbar / (de + i*eta)  with rbar = -i v/w.
+    # The perturbation vertex is the full r = rbar + a^(H): the a^(H) part
+    # is added with the same DC denominator (kept separate so the
+    # correction-off path is bit-identical to the original expression).
     psip = {}
     psim = {}
     for d in dir_chars:
         denom = de_mtx * (de_mtx + 1j * eta)
         pert = np.where(nondeg, 1j * delta * vmtx[d] / denom, 0.0)
+        if a_H is not None:
+            pert = pert + np.where(nondeg, -delta * a_H[d] / (de_mtx + 1j * eta), 0.0)
         psip[d] = psi + psi @ pert
         psim[d] = psi - psi @ pert
 
@@ -246,17 +272,6 @@ def _process_kpoint(system, k, params):
         for d3 in dir_chars:
             vmtxp[d1][d3] = psip[d3].conj().T @ vtb[d1] @ psip[d3]
             vmtxm[d1][d3] = psim[d3].conj().T @ vtb[d1] @ psim[d3]
-
-    # --- Position operator, with the Wannier-gauge correction if enabled ---
-    # Only A^(W) is needed here, not its k-derivative: the metric involves r
-    # itself, never the generalized derivative r^{a;b}.
-    #
-    # Masking follows chi^(2)/delta_Q: `nondeg` applies to the 1/w factor
-    # only.  a^(H) is smooth across a degeneracy and is added unmasked (its
-    # diagonal is already zeroed by `offdiag_A_H`).
-    A_W, _ = compute_A_W_k(system, k, dir_chars, enabled=wannier_r,
-                           need_deriv=False)
-    a_H = offdiag_A_H(A_W, psi, dir_chars)
 
     # The perturbed connections use the same A^(W) rotated by the perturbed
     # states.  `pert` is anti-Hermitian, so psip is unitary to first order and

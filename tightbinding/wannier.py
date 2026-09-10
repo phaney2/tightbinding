@@ -257,30 +257,97 @@ def build_system_from_hr(hr_path: str,
     )
 
 
+def _symmetrize_position_blocks(displacements, r_matrices):
+    """Impose r(-R) = r(R)^dagger on the position blocks, in place.
+
+    Wannier90's ``write_tb`` evaluates the off-diagonal elements with the
+    finite-difference formula (Eq. 44 of Wang, Yates, Souza & Vanderbilt,
+    PRB 74, 195118), which does not preserve the Hermiticity of the Berry
+    connection; ``postw90`` takes the Hermitian part before using it
+    (``get_oper.F90``, ``get_AA_R``) and so must we.  Averaging r(R) with
+    r(-R)^dagger is exactly Hermitianizing A^(W)(k) at every k.
+
+    Returns the largest |r(R) - r(-R)^dagger| found, as a diagnostic.
+    Raises if the R-set is not inversion-symmetric (Wannier90's Wigner-Seitz
+    set always is).
+    """
+    index = {tuple(int(round(x)) for x in R): i for i, R in enumerate(displacements)}
+    worst = 0.0
+    done = set()
+    for R, i in index.items():
+        j = index.get(tuple(-x for x in R))
+        if j is None:
+            raise ValueError(
+                f"_tb.dat position blocks: R-vector {R} has no -R partner, so "
+                f"r(-R) = r(R)^dagger cannot be imposed"
+            )
+        if (j, i) in done:
+            continue
+        done.add((i, j))
+        for a in range(3):
+            ri, rj = r_matrices[i][a], r_matrices[j][a]
+            worst = max(worst, float(np.abs(ri - rj.conj().T).max()))
+            sym = 0.5 * (ri + rj.conj().T)
+            r_matrices[i][a] = sym
+            r_matrices[j][a] = sym.conj().T
+    return worst
+
+
 def build_system_from_tb(tb_path: str,
                          centres_path: str = None,
                          ) -> System:
     """Build a System from a Wannier90 _tb.dat file.
 
     The _tb.dat file contains lattice vectors (so they need not be specified
-    in the YAML config) and position operator matrix elements (parsed and
-    stored for later use in response calculations).
+    in the YAML config) and position operator matrix elements, stored for the
+    Wannier-gauge position correction (see calc/wannier_gauge.py).
 
     Parameters
     ----------
     tb_path : path to the *_tb.dat file
-    centres_path : optional path to *_centres.xyz for Wannier function positions.
-                   If provided, builds proper atompos for velocity operators.
+    centres_path : optional path to *_centres.xyz.  When given, the Wannier
+                   centres come from it; otherwise from the band-diagonal of
+                   the R=0 position block.  See "Gauge" below for why a
+                   centres file is the safer choice.
 
     Returns
     -------
-    System object ready for band structure and response calculations.
-    The Hamiltonian blocks are divided by degeneracy weights and the
-    displacement vectors are converted to Cartesian coordinates.
-    The position operator matrices are stored in system.wannier_r_matrices
-    (list of [r_x, r_y, r_z] per R-vector, degeneracy-divided) and
-    system.wannier_r_displacements (lattice-coordinate R-vectors).
+    System with ``matrices`` (degeneracy-divided), ``atompos`` built from the
+    Wannier centres, ``wannier_r_matrices`` (list of [r_x, r_y, r_z] per
+    R-vector, degeneracy-divided, Hermitian-paired, R=0 diagonal repaired),
+    ``wannier_r_displacements`` (lattice-coordinate R-vectors) and
+    ``_wannier_centres`` (the centres used, shape (norbs, 3)).
+
+    Gauge
+    -----
+    ``atompos`` is always built from the Wannier centres, so `bloch.get_H_k`
+    works in the atomic gauge exp(ik·(R + tau_m - tau_n)).  Two reasons:
+    (i) with ``wannier_r`` off, r = -i v/w is then the point-like-orbital
+    approximation, which is physically sensible, whereas in the lattice
+    gauge (atompos = 0) it is missing the whole intra-cell term;
+    (ii) `compute_A_W_k` subtracts the centres that atompos encodes, so the
+    correction is consistent with H(k) either way — but the diagonal repair
+    below is only meaningful if the centres are the true ones.
+
+    Position-block conditioning
+    ---------------------------
+    Two known defects of Wannier90's ``_tb.dat`` position blocks are handled
+    here, with a one-line diagnostic printed for each:
+
+    * Off-diagonal elements are not Hermitian-paired (finite-difference
+      formula); they are symmetrized, r(-R) <- r(R)^dagger averaged.
+    * The band-diagonal R=0 elements <0n|r|0n> come from a Berry-phase
+      log and can be wrapped by a lattice vector, or scrambled outright
+      when a centre sits on the branch cut (e.g. an atom at c/2 with a
+      single k-point along c).  They are compared with the centres and
+      replaced by them where they differ.  The band-diagonal R != 0
+      elements of an affected component come from the same log and are
+      likely unreliable too; the diagnostic names the component so the
+      user can avoid it.  A centres file avoids relying on that diagonal
+      at all, which is why passing one is recommended.
     """
+    from . import parallel
+
     lattice_vectors, norbs, displacements, degeneracies, H_matrices, r_matrices = \
         read_tb(tb_path)
 
@@ -301,11 +368,54 @@ def build_system_from_tb(tb_path: str,
             S=S,
         ))
 
-    # Divide position operator matrices by degeneracy weights
+    # Position blocks: divide by degeneracy (same Fourier-sum origin as H,
+    # same Wigner-Seitz bookkeeping), then Hermitian-pair them.
     r_matrices_scaled = []
     for i, r_xyz in enumerate(r_matrices):
         deg = degeneracies[i]
         r_matrices_scaled.append([r / deg for r in r_xyz])
+    asym = _symmetrize_position_blocks(displacements, r_matrices_scaled)
+
+    # Wannier centres: from the file if given, else the R=0 band-diagonal.
+    r0_idx = next(i for i, R in enumerate(displacements) if np.allclose(R, 0))
+    diag_centres = np.stack(
+        [np.diag(r_matrices_scaled[r0_idx][a]).real for a in range(3)], axis=1)
+    if centres_path is not None:
+        centres = read_centres(centres_path)
+        if len(centres) != norbs:
+            raise ValueError(
+                f"Number of Wannier centres ({len(centres)}) does not match "
+                f"number of orbitals ({norbs}) in _tb.dat"
+            )
+        source = f"{centres_path}"
+    else:
+        centres = diag_centres.copy()
+        source = "R=0 diagonal of the position blocks (no centres file given)"
+
+    # Repair the R=0 band-diagonal against the centres.
+    dev = np.abs(diag_centres - centres)
+    bad = dev > 1e-4
+    for a in range(3):
+        blk = r_matrices_scaled[r0_idx][a]
+        blk[np.arange(norbs), np.arange(norbs)] = centres[:, a]
+
+    parallel.print_root(
+        f"  [wannier_tb] {norbs} WFs, {len(displacements)} R-vectors; centres from "
+        f"{source}; position blocks Hermitian-paired (max asymmetry "
+        f"{asym:.2e} A)"
+    )
+    if bad.any():
+        comps = ''.join(c for a, c in enumerate('xyz') if bad[:, a].any())
+        wfs = [n + 1 for n in range(norbs) if bad[n].any()]
+        parallel.print_root(
+            f"  [wannier_tb] WARNING: the R=0 band-diagonal of the position "
+            f"blocks disagrees with the centres for WF(s) {wfs} in "
+            f"component(s) '{comps}' (max {dev.max():.3f} A) — Berry-phase "
+            f"wrapping or branch-cut scramble in Wannier90's <0n|r|0n>.  "
+            f"Replaced by the centres.  The band-diagonal R!=0 elements of "
+            f"'{comps}' come from the same log and may be unreliable: avoid "
+            f"the '{comps}' position operator from this file."
+        )
 
     # Single dummy atom encompassing all Wannier orbitals
     atoms = [Atom(
@@ -317,21 +427,12 @@ def build_system_from_tb(tb_path: str,
         species='W',
     )]
 
-    # Build atompos from Wannier centres if available
-    if centres_path is not None:
-        centres = read_centres(centres_path)
-        if len(centres) != norbs:
-            raise ValueError(
-                f"Number of Wannier centres ({len(centres)}) does not match "
-                f"number of orbitals ({norbs}) in _tb.dat"
-            )
-        ax = -(centres[:, 0, None] - centres[None, :, 0])
-        ay = -(centres[:, 1, None] - centres[None, :, 1])
-        az = -(centres[:, 2, None] - centres[None, :, 2])
-        atompos = AtomPos(x=ax, y=ay, z=az)
-    else:
-        z = np.zeros((norbs, norbs))
-        atompos = AtomPos(x=z, y=z, z=z)
+    # atompos.x[i,j] = -(r_i - r_j)_x, matching the TB code convention:
+    # atomic gauge, always.
+    ax = -(centres[:, 0, None] - centres[None, :, 0])
+    ay = -(centres[:, 1, None] - centres[None, :, 1])
+    az = -(centres[:, 2, None] - centres[None, :, 2])
+    atompos = AtomPos(x=ax, y=ay, z=az)
 
     system = System(
         atoms=atoms,
@@ -341,14 +442,9 @@ def build_system_from_tb(tb_path: str,
         atompos=atompos,
     )
 
-    # Store position operator data for later use in response calculations
+    # Store position operator data for the Wannier-gauge correction
     system.wannier_r_matrices = r_matrices_scaled
     system.wannier_r_displacements = displacements
-
-    # Store Wannier centres for position operator corrections (Eq. 20, arXiv:1804.04030)
-    if centres_path is not None:
-        system._wannier_centres = centres
-    else:
-        system._wannier_centres = np.zeros((norbs, 3))
+    system._wannier_centres = centres
 
     return system

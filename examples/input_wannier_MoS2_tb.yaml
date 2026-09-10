@@ -1,5 +1,9 @@
 system:
   wannier_tb: /home/haney411/wrk/qe/MoS2_wannier/mos2_tb.dat
+  # Recommended for any response calculation on _tb.dat input: the centres set
+  # the atomic-gauge Bloch phases and let the loader validate the file's own
+  # R=0 position diagonal (see docs/user_guide.md, 'wannier_r').
+  # wannier_centres: /home/haney411/wrk/qe/MoS2_wannier/mos2_centres.xyz
 
 calc:
   type: band_structure

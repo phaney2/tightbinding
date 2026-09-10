@@ -16,11 +16,12 @@ from .. import parallel
 from .nonlinear_optical_fast import _process_kpoint_fast
 from .freq_integral import FreqIntegralSpec
 from .wannier_gauge import (
-    WANNIER_R_DEFAULT, compute_A_W_k, resolve_wannier_r, system_has_wannier_r,
+    WANNIER_R_DEFAULT, apply_wannier_correction, compute_A_W_k,
+    resolve_wannier_r, system_has_wannier_r,
 )
 
-# Back-compat alias: BUG_wannier_r_correction.md and scratch scripts import
-# `_compute_A_W_k` from this module.  The implementation moved to
+# Back-compat alias: older scratch scripts import `_compute_A_W_k` from this
+# module.  The implementation moved to
 # calc/wannier_gauge.py so that every engine gates the same kernel through the
 # same switch; the 3-argument call form is unchanged.
 _compute_A_W_k = compute_A_W_k
@@ -423,63 +424,21 @@ def _process_kpoint(
                 return_terms=True,
             )
 
-    # --- Wannier position operator corrections (arXiv:1804.04030) ---
+    # --- Wannier-gauge position correction (calc/wannier_gauge.py) ---
+    # Eq. 22 on r, the covariant-derivative correction on r^{a;b} (registered
+    # as the 'wannier_corr' Sipe sub-term so the sub-terms still sum exactly
+    # to dk_rmtx), and the physical velocity v = i[H, r] as the current vertex
+    # used below.  The bare v has already gone into Delta and the Sipe sum
+    # rule, where it belongs.  All no-ops when the flag is off or the system
+    # carries no position matrices.
     A_W, dA_W = compute_A_W_k(system, k, dir_chars, enabled=wannier_r)
-    if A_W is not None:
-        # Rotate to Hamiltonian gauge: A^(H) = U† A^(W) U
-        A_H = {}
-        for d in dir_chars:
-            A_H[d] = psi.conj().T @ A_W[d] @ psi
-
-        # Off-diagonal part = external Berry connection a_nm
-        a_H = {}
-        for d in dir_chars:
-            a_H[d] = A_H[d].copy()
-            np.fill_diagonal(a_H[d], 0.0)
-
-        # Eq. 22: r_nm += a_nm (off-diagonal only)
-        # Save internal-only r_bar for dk_rmtx correction
-        r_bar = {}
-        for d in dir_chars:
-            r_bar[d] = rmtx[d].copy()
-            rmtx[d] = rmtx[d] + a_H[d]
-
-        # Rotate dA_W to Hamiltonian gauge
-        dA_H = {}
-        for d1 in dir_chars:
-            dA_H[d1] = {}
-            for d2 in dir_chars:
-                dA_H[d1][d2] = psi.conj().T @ dA_W[d1][d2] @ psi
-
-        # Diagonal Berry connection: xi_nn^d = A^(H)_{nn,d}
-        xi_diag = {}
-        for d in dir_chars:
-            xi_diag[d] = np.diag(A_H[d]).real.copy()
-
-        # Eq. 36 corrections to dk_rmtx
+    rmtx, corr, vcur = apply_wannier_correction(
+        A_W, dA_W, psi, rmtx, dir_chars, vmtx=vmtx, de_mtx=de_mtx)
+    if corr is not None:
         for d1 in dir_chars:
             for d2 in dir_chars:
-                # Term 1: ordinary derivative of a_nm rotated to H-gauge
-                corr = dA_H[d1][d2].copy()
-                np.fill_diagonal(corr, 0.0)
-
-                # Term 2: connection terms (covariant derivative)
-                # Σ_p r̄_np^{d2} a_pm^{d1} - a_np^{d1} r̄_pm^{d2}
-                corr += r_bar[d2] @ a_H[d1] - a_H[d1] @ r_bar[d2]
-
-                # Term 3: diagonal Berry connection
-                # i (ξ_nn^{d2} - ξ_mm^{d2}) a_nm^{d1}
-                xi_diff = xi_diag[d2][:, None] - xi_diag[d2][None, :]
-                corr += 1j * xi_diff * a_H[d1]
-
-                # Clean: zero diagonal
-                np.fill_diagonal(corr, 0.0)
-
-                dk_rmtx[d1][d2] = dk_rmtx[d1][d2] + corr
-                # Register corr as a separate Sipe sub-term so the
-                # 4 sub-terms sum exactly to dk_rmtx.
-                if d1 in dk_rmtx_terms and d2 in dk_rmtx_terms[d1]:
-                    dk_rmtx_terms[d1][d2]['wannier_corr'] = corr
+                dk_rmtx[d1][d2] = dk_rmtx[d1][d2] + corr[d1][d2]
+                dk_rmtx_terms[d1][d2]['wannier_corr'] = corr[d1][d2]
 
     # Now loop over ef and omega
     kpt = {}
@@ -522,10 +481,16 @@ def _process_kpoint(
             d2k_f[d] = {}
             for d2 in dir_chars:
                 pair = d + d2
-                vv_diag = np.diag(vvmtx[pair])
+                # Band curvature d_d d_d2 E_n = <n|d d H|n> + 2 Re sum_m v_nm v_mn / w_nm
+                # (Hellmann-Feynman twice).  The diagonal of the second
+                # derivative of H alone is neither the curvature nor gauge
+                # invariant; the interband sum rule completes it (bare v, as
+                # for every band-energy identity).
+                curv = (np.diag(vvmtx[pair])
+                        + 2.0 * np.real(np.sum(vmtx[d] * vmtx[d2].T * inv_de, axis=1)))
                 v1_diag = np.diag(vmtx[d])
                 v2_diag = np.diag(vmtx[d2])
-                d2k_f[d][d2] = vv_diag * de_f + v1_diag * v2_diag * de2_f
+                d2k_f[d][d2] = curv * de_f + v1_diag * v2_diag * de2_f
 
         for eind, omega1_val in enumerate(omega1list):
             omega1_mtx = omega1_val * np.ones((dim, dim))
@@ -541,7 +506,7 @@ def _process_kpoint(
                     np.diag(d2k_f[dir_b][dir_c]) / (omega2_val + 1j * eta_val) +
                     np.diag(d2k_f[dir_c][dir_b]) / (omega1_val + 1j * eta_val)
                 )
-                kpt['chi_ii'][abc][efind, eind] = np.trace(vmtx[dir_a] @ rho_ii)
+                kpt['chi_ii'][abc][efind, eind] = np.trace(vcur[dir_a] @ rho_ii)
 
                 # ---- inter-inter (chi_ee1, chi_ee2) ----
                 G1 = f_mtx * rmtx[dir_b] / (omega1_mtx - de_mtx + 1j * eta_mtx)
@@ -552,8 +517,8 @@ def _process_kpoint(
                 rho_ee2 = G2 @ rmtx[dir_b] - rmtx[dir_b] @ G2
                 rho_ee2 = rho_ee2 / (omega1_mtx + omega2_mtx - de_mtx + 2j * eta_mtx)
 
-                kpt['chi_ee1'][abc][efind, eind] = np.trace(vmtx[dir_a] @ rho_ee1)
-                kpt['chi_ee2'][abc][efind, eind] = np.trace(vmtx[dir_a] @ rho_ee2)
+                kpt['chi_ee1'][abc][efind, eind] = np.trace(vcur[dir_a] @ rho_ee1)
+                kpt['chi_ee2'][abc][efind, eind] = np.trace(vcur[dir_a] @ rho_ee2)
 
                 # ---- inter-intra (chi_ei) ----
                 denom12 = 1.0 / (omega1_mtx + omega2_mtx - de_mtx + 2j * eta_mtx)
@@ -571,7 +536,7 @@ def _process_kpoint(
                 t5 = -1j * denom12 * (rmtx[dir_b] * f_mtx * Delta[dir_c] / (omega1_mtx - de_mtx + 1j * eta_mtx)**2)
                 t6 = -1j * denom12 * (rmtx[dir_c] * f_mtx * Delta[dir_b] / (omega2_mtx - de_mtx + 1j * eta_mtx)**2)
 
-                va = vmtx[dir_a]
+                va = vcur[dir_a]   # physical current vertex
                 kpt['chi_eit1'][abc][efind, eind] = np.trace(va @ (t1 + t2))
                 kpt['chi_eit2'][abc][efind, eind] = np.trace(va @ (t3 + t4))
                 kpt['chi_eit3'][abc][efind, eind] = np.trace(va @ (t5 + t6))

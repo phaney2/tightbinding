@@ -2,9 +2,10 @@
 
 **Status:** fixed 2026-08-27. Requested the same day; this file is now the
 record of what was decided and why, not an open item.
-**Related:** `BUG_wannier_r_correction.md` (still open — the correction
-itself is defective). This note was always about the *switch*, not the
-physics.
+**Related:** `BUG_wannier_r_correction.md` (resolved 2026-09-10 — the
+correction itself was defective in five ways; that file has the account).
+This note was always about the *switch*, not the physics. Two of its
+statements are superseded and marked below.
 
 ---
 
@@ -51,15 +52,11 @@ exactly the failure this whole exercise was about. A non-boolean value
 raises too. `config.load_config` runs the same validator, so YAML
 mistakes fail at load rather than mid-sweep.
 
-**Default: `False`, temporarily.** `WANNIER_R_DEFAULT` in
-`wannier_gauge.py` carries a `TODO` tying it to
-`BUG_wannier_r_correction.md`. `True` is the physically correct value and
-must be restored when that bug closes; `False` is the diagnostic setting,
-chosen so new results do not silently inherit the defect. **This changes
-chi^(2) and `delta_Q` results on `_tb.dat` input** for anyone re-running
-without setting the flag. TB_simple models are unaffected bitwise.
-On a system that actually carries `wannier_r_matrices` the engines warn
-at *both* settings, because with the bug open neither is trustworthy.
+**Default: `False`, temporarily.** *(Superseded 2026-09-10: the default is
+`True` again, both settings print a one-line note, and `False` is the
+point-like-orbital approximation in the atomic gauge.)* While the bug was
+open, `False` was the diagnostic setting, chosen so new results did not
+silently inherit the defect. TB_simple models are unaffected bitwise.
 
 **`quantum_metric`: the correction was implemented, not refused.** `Q`,
 `dQ` and `dQf` are all quadratic forms in `r`, now built through a single
@@ -71,6 +68,13 @@ the states are perturbed — `1/de` stays unperturbed, matching the
 pre-existing scheme. Masking follows chi^(2)/`delta_Q`: the degeneracy
 mask applies to the `1/w` factor only, and `a^(H)`, smooth across a
 degeneracy, is added unmasked.
+
+*(Added 2026-09-10: the perturbation vertex `pert` now uses the full
+`r = -i v/w + a^(H)` too. Even so the finite-difference `dQ` is not
+gauge-covariant with the correction on — `Q` and `dQf` are — because
+rotating the bare velocity by the perturbed states and dividing by the
+unperturbed `1/de` is a heuristic; see `examples/test_wannier_gauge.py`
+and the technical reference. The engine prints a note.)*
 
 `_rr_sum` is written expanded rather than as `r1 * conj(r2)`, keeping the
 leading term in its original factor order. That is not fussiness: `dQ` is
@@ -90,6 +94,9 @@ expanded form makes the correction-off path bit-exact.
 - **`quantum_metric` still uses a hard `DEG_THR = 1e-5` cutoff** where
   chi^(2) and `delta_Q` use Souza `eta_sos` regularization. Unrelated to
   this change and left alone.
+- **The Eq. 36 algebra was still copy-pasted into three call sites** by
+  this change; it was wrong in all three and is now one function,
+  `apply_wannier_correction` (2026-09-10).
 
 ## 4. Verification
 
@@ -112,6 +119,11 @@ its `git worktree` baseline comparison at HEAD, `test_delta_Q_projector.py`,
 `honeycomb_warp/check_eq13.py`. The three benchmark configs
 (`input_qm_test`, `input_nonlinear_test`, `input_delta_Q_test`) are
 **bit-identical** before and after.
+
+`examples/test_wannier_gauge.py` (2026-09-10) adds the physics
+certificates: gauge covariance at the operator and engine level, a
+finite-difference check with a k-dependent connection, Hermiticity, and an
+optional real-`_tb.dat` section.
 
 ## 5. What is *not* affected
 

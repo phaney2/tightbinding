@@ -494,15 +494,35 @@ weights and displacement vectors are converted to Cartesian.
 #### `build_system_from_tb(tb_path, centres_path=None) -> System`
 
 Builds a `System` from a `_tb.dat` file. Lattice vectors are read from the
-file. In addition to the Hamiltonian, parses and stores the position operator
-matrices as `system.wannier_r_matrices` (list of `[r_x, r_y, r_z]` per
-R-vector, degeneracy-divided) and `system.wannier_r_displacements`
-(lattice-coordinate R-vectors).
+file. The position operator blocks are stored as `system.wannier_r_matrices`
+(list of `[r_x, r_y, r_z]` per R-vector) and `system.wannier_r_displacements`
+(lattice-coordinate R-vectors), after three conditioning steps, each with a
+printed diagnostic:
+
+1. degeneracy division (same Wigner-Seitz bookkeeping as H);
+2. Hermitian pairing `r(R) ← ½[r(R) + r(-R)†]` — Wannier90's `write_tb`
+   evaluates the off-diagonal elements with the finite-difference Eq. 44 of
+   Wang, Yates, Souza & Vanderbilt (PRB 74, 195118), which does not preserve
+   Hermiticity, and `postw90` takes the Hermitian part before use; on the MoS2
+   file the asymmetry is 1.3e-2 Å;
+3. repair of the R=0 band-diagonal against the Wannier centres (the
+   `_centres.xyz` file if given, else that diagonal itself). The diagonal
+   comes from a Berry-phase log and can be wrapped by a lattice vector, or
+   scrambled when a centre sits on the branch cut (an atom at c/2 with one
+   k-point along c). Entries that disagree are replaced by the centres and the
+   affected component is named in a warning, because its band-diagonal R≠0
+   elements come from the same log and are suspect too.
+
+`atompos` is **always** built from the centres, so `_tb.dat` systems run in
+the atomic gauge like every other input; `system._wannier_centres` keeps the
+centres used.
 
 **Common to both builders:**
 - All Wannier orbitals are grouped under a single dummy `Atom` with `basis='wannier'`
 - Overlap matrices are identity (on-site) or zero (off-site) — orthogonal Wannier basis
-- `AtomPos` is built from Wannier centres if a `_centres.xyz` file is provided
+- `AtomPos` is built from the Wannier centres: from a `_centres.xyz` file if provided;
+  for `_tb.dat` input otherwise from the file's R=0 position diagonal (see above); for
+  `_hr.dat` input otherwise zero (lattice gauge)
 
 ---
 
@@ -566,9 +586,15 @@ per-k-point work is done by `nonlinear_optical_fast._process_kpoint_fast`;
 3. Build velocity matrix in eigenbasis: `v_nm = ψ†·vtb·ψ`
 4. Build position operator: `r_nm = -i·v_nm / (E_n - E_m)` for n ≠ m
 5. Build generalized derivative `dk_r` via `_compute_dk_rmtx`
-6. Apply the Wannier-gauge correction to both (Eqs. 22 and 36) when
-   `system.wannier_r` is on — see `calc/wannier_gauge.py`
-7. Compute 14 chi components for each (ef, ω1) pair
+6. Apply the Wannier-gauge correction (`apply_wannier_correction`) when
+   `system.wannier_r` is on: to `r`, to `dk_r`, and to the interband part of
+   the current vertex `v` (the bare `v` stays in Δ, the Sipe sum rule and the
+   band curvature) — see `calc/wannier_gauge.py`
+7. Compute 14 chi components for each (ef, ω1) pair. The second k-derivative
+   of the occupation in `chi_ii` uses the band curvature
+   `∂_b∂_c E_n = <n|∂_b∂_c H|n> + 2 Re Σ_m v^b_nm v^c_mn / w_nm`; the
+   diagonal of ∂²H alone is neither the curvature nor gauge invariant
+   (fixed 2026-09-10; metallic `chi_ii` before that is wrong)
 
 **14 chi components:**
 `chi_ii`, `chi_ee1`, `chi_ee2`, `chi_ei1`, `chi_ei2`,
@@ -740,44 +766,71 @@ sampled-mode regression against a `git worktree` baseline passed as `argv[1]`).
 
 ### `calc/wannier_gauge.py`
 
-The single switch and the single kernel for the Wannier-gauge position
-correction. Every engine that builds an `r` operator — `nonlinear_optical`,
-`nonlinear_optical_fast`, `delta_Q`, `quantum_metric` — goes through both, so
-they cannot drift apart. A new engine with a position operator must do the same.
+The single switch, kernel and application function for the Wannier-gauge
+position correction. Every engine that builds an `r` operator —
+`nonlinear_optical`, `nonlinear_optical_fast`, `delta_Q`, `quantum_metric` —
+goes through them, so they cannot drift apart. A new engine with a position
+operator must do the same.
 
 #### `compute_A_W_k(system, k, dir_chars=None, enabled=True, need_deriv=True)`
 
-Fourier-interpolates the Wannier position matrices (Eq. 20 of
-arXiv:1804.04030):
+Fourier-interpolates the Wannier position matrices into the Berry connection
+of the gauge `bloch.get_H_k` uses (Bloch phases with the centres τ from
+`atompos`):
 
 ```
-A^(W)_{k,nm,a} = Σ_R exp(ik·(R + τ_m - τ_n)) <0n|r̂_a - τ_{m,a}|Rm>
+A^(W)_{nm,a}(k) = Σ_R exp(ik·(R + τ_m - τ_n)) <0n|r̂_a|Rm>  -  τ_{n,a} δ_nm
 ```
+
+Eq. 20 of arXiv:1804.04030 is the τ = 0 case; the τ terms are the gauge
+transformation of A under the diagonal unitary exp(ik·τ). The subtracted
+centres come from `atompos` (`wannier_centres_from_atompos`), so H(k) and
+A^(W)(k) are in one gauge by construction; a common shift of all centres is
+a multiple of the identity and drops out of everything built here.
 
 Returns `(A_W, dA_W)` with `A_W[d]` and `dA_W[d1][d2] = ∂_{d2} A^(W)_{d1}`, or
 `(None, None)` when `enabled=False` or the system has no `wannier_r_matrices`.
-Both cases returning `None` is what lets every call site keep a single
-`if A_W is not None:` guard with no separate branch for the flag.
-`need_deriv=False` skips `dA_W` for callers that only correct `r` itself.
+`need_deriv=False` skips `dA_W`.
 
-This function was `nonlinear_optical._compute_A_W_k` before the switch was
-unified; that name survives there as an alias.
+#### `apply_wannier_correction(A_W, dA_W, psi, rmtx, dir_chars, vmtx=None, de_mtx=None)`
+
+Takes the bare eigenbasis operators (`rmtx = -i v/w`, optionally `vmtx` with
+`de_mtx = E_n - E_m`) and returns `(r, corr, v)`. With Ā = U†A^(W)U,
+a = offdiag(Ā), ξ = diag(Ā), rbar = -i v/w:
+
+```
+r^a          = rbar^a + a^a                                                (Eq. 22)
+corr^{a;b}   = U†(∂_b A^(W)_a)U - i[a^a, rbar^b]
+               - i(ξ^b_nn - ξ^b_mm)(a^a + rbar^a)_nm - i(ξ^a_nn - ξ^a_mm) rbar^b_nm
+v^a_nm       = vbar^a_nm + i w_nm a^a_nm      (n ≠ m; the physical velocity i[H, r])
+```
+
+`corr` is added to the TB Sipe sum-rule `r^{a;b}` so the total is the
+generalized derivative `∂_b r^a - i(ξ^b_nn - ξ^b_mm) r^a` of the corrected r
+(derivation in the docstring: the covariant derivative of any U†XU is
+U†(∂X)U + [U†XU, D^off] - i(Ā_nn - Ā_mm)(U†XU)_nm, the diagonal D_nn cancels,
+and D^off = -i rbar). Each piece satisfies corr_nm* = corr_mn. Returns
+`(rmtx, None, vmtx)` unchanged when `A_W` is None.
+
+Which operator goes where is fixed by one rule — every engine output must be
+independent of the gauge the system was built in — and enforced by
+`examples/test_wannier_gauge.py`: the corrected r, r^{a;b} and v are used for
+the interband position operator, its generalized derivative, the current
+vertex, the projector-derivative factors of the `subspace`/`band` delta_Q
+formulations and the perturbation vertex of `quantum_metric`; the bare v
+stays in Δ = v_nn - v_mm, the Sipe sum rule, the band curvature and the
+inverse-mass sum rule (all derivatives of H(k)).
 
 #### `resolve_wannier_r(cfg, system, engine) -> bool`
 
-Reads `cfg['system']['wannier_r']`, defaulting to `WANNIER_R_DEFAULT`. Raises
-on a non-boolean value and on the old `cfg['calc']['wannier_r']` location.
-Prints one notice per engine per run: *inert* when the system carries no
-position matrices, and a warning naming `BUG_wannier_r_correction.md` at
-**either** setting when it does — with that bug open, neither value gives a
-trustworthy answer on `_tb.dat` input.
+Reads `cfg['system']['wannier_r']`, defaulting to `WANNIER_R_DEFAULT = True`.
+Raises on a non-boolean value and on the old `cfg['calc']['wannier_r']`
+location. Prints one notice per engine per run: *inert* when the system
+carries no position matrices; otherwise which setting is active (`False`
+is the point-like-orbital approximation, a diagnostic).
 
-`WANNIER_R_DEFAULT` is currently `False`, which is *not* the physically correct
-value; it is the diagnostic setting, chosen while the correction is known
-defective. Flip it back to `True` when the bug closes.
-
-Also exports `system_has_wannier_r(system)`, `validate_wannier_r(cfg)` (called
-from `config.load_config` so YAML errors surface at load time),
+Also exports `wannier_centres_from_atompos(system)`, `system_has_wannier_r(system)`,
+`validate_wannier_r(cfg)` (called from `config.load_config`),
 `warn_unused_wannier_r(cfg, calc_type)` (called from `main._dispatch` for
 engines with no position operator), `offdiag_A_H(A_W, psi, dir_chars)`, and
 `reset_notices()` for tests that drive many runs in one process.
@@ -794,7 +847,8 @@ engines with no position operator), `offdiag_A_H(A_W, psi, dir_chars)`, and
 3. Velocity in eigenbasis: `v_nm = ψ†·vtb·ψ`
 4. Build perturbed eigenstates via finite-difference:
    ```
-   pert = i·δ·v_nm / [ΔE_nm · (ΔE_nm + i·η)]    (zero for degenerate pairs)
+   pert = i·δ·v_nm / [ΔE_nm · (ΔE_nm + i·η)]  -  δ·a^(H)_nm / (ΔE_nm + i·η)
+        = -δ · r_nm / (ΔE_nm + i·η)   with the full r = -i v/w + a^(H)   (zero for degenerate pairs)
    ψ± = ψ ± ψ·pert
    ```
 5. Compute perturbed velocity matrices: `v±[d1][d3] = ψ±[d3]†·vtb[d1]·ψ±[d3]`
@@ -832,6 +886,14 @@ contribution). Note this is a hard cutoff, unlike the Souza `eta_sos`
 regularization used by `nonlinear_optical.py` and `delta_Q.py` — an
 inconsistency that predates the shared position operator.
 
+**Gauge covariance:** `Q` and `dQf` are gauge-covariant with the Wannier
+correction on (`examples/test_wannier_gauge.py`). The finite-difference `dQ`
+is not — rotating the bare velocity by the perturbed states and dividing by
+the unperturbed `1/de` is a heuristic whose O(δ) error does not transform
+covariantly; a consistent version needs the k-derivatives of the perturbed
+states, which is what `delta_Q` computes analytically. The engine prints a
+note when the correction is active.
+
 ---
 
 ### `calc/delta_Q.py`
@@ -844,9 +906,9 @@ Eq. eq:final of `delta_Q_metal_finite_T.pdf` (metals at finite T),
 `subspace` the T=0 occupied projector of `delta_Q_occ_derivation`, and
 `band` Eq. 40 of `revised_formula_sheet_eta.pdf`.
 
-> ⚠️ Shares `compute_A_W_k` with `nonlinear_optical.py` and
-> `quantum_metric.py`, and that function is currently broken for Wannier input
-> — see `BUG_wannier_r_correction.md`. TB_simple systems are unaffected:
+> Shares `compute_A_W_k` / `apply_wannier_correction` with
+> `nonlinear_optical.py` and `quantum_metric.py` (`BUG_wannier_r_correction.md`
+> records the 2026-09 fix of that machinery). TB_simple systems are unaffected:
 > `bloch.py` builds H(k) in the atomic gauge, where the tight-binding position
 > operator is exactly `r = -i v/ω` with no intra-cell correction, so
 > `compute_A_W_k` correctly returns `None`.
@@ -898,7 +960,12 @@ both keys raises):
   `T_mix`.
 
 Subspace and band share `_compute_pair_matrices`, which returns the pair
-integrands before the outer contraction; only the outer mask differs. The
+integrands before the outer contraction; only the outer mask differs. Its
+projector-derivative factors `v/ω` are written as `i·r` with the full
+interband r (bare part: exactly `v·inv_de`), as are those of
+`_compute_T_mix_pair`, so all three formulations use the same corrected
+position operator on Wannier input; `vmtx` reaches those two functions but is
+unused. The `T_Sipe_*` split is gauge-dependent; only the sum is physical. The
 thermal path has its own assembly (the weights differ in *structure*, not just
 mask) but is pinned to the others by the insulator-limit regression in
 `examples/test_dQ_thermal.py`.
