@@ -231,6 +231,8 @@ def _save_delta_Q(result, cfg):
     qty_names = ['Q_tilde', 'delta_Q']
     if 'delta_Q_tau' in result:
         qty_names.append('delta_Q_tau')
+    if 'delta_Q_k' in result:
+        qty_names.append('delta_Q_k')
     for qty_name in qty_names:
         qty = result[qty_name]
         for d1, v1 in qty.items():
@@ -248,6 +250,10 @@ def _save_delta_Q(result, cfg):
                 for d3, v3 in v2.items():
                     for tname, arr in v3.items():
                         flat[f"delta_Q_terms.{d1}.{d2}.{d3}.{tname}"] = arr
+    # k-grid that indexes the first axis of delta_Q_k
+    for key in ('kpoints', 'nk_grid'):
+        if key in result:
+            flat[key] = result[key]
     _save_npz(output_file, flat, cfg)
 
 
@@ -255,9 +261,14 @@ def load_delta_Q(path):
     """Load delta Q results from .npz.
 
     Returns (result_dict, config_dict).
-    result_dict has keys 'Q_tilde', 'delta_Q', and 'delta_Q_tau' when
-    the RTA transport piece was computed (thermal formulation; the
-    values are per unit relaxation time).
+    result_dict has keys 'Q_tilde', 'delta_Q', 'delta_Q_terms', and
+    'delta_Q_tau' when the RTA transport piece was computed (thermal
+    formulation; the values are per unit relaxation time).
+
+    With calc.save_kresolved it also has 'delta_Q_k'[a][b][c] of shape
+    (nk1*nk2, nef) — the unweighted per-k integrand, whose mean over the
+    k axis is delta_Q[a][b][c] — plus 'kpoints' (nk1*nk2, 3) and
+    'nk_grid' [nk1, nk2] to reshape it into a map.
     """
     data, cfg = _load_npz(path)
     result = {'Q_tilde': {}, 'delta_Q': {}}
@@ -266,7 +277,9 @@ def load_delta_Q(path):
             continue
         parts = key.split('.')
         qty_name = parts[0]
-        if len(parts) == 3:
+        if len(parts) == 1:
+            result[qty_name] = data[key]
+        elif len(parts) == 3:
             _, d1, d2 = parts
             result.setdefault(qty_name, {})
             result[qty_name].setdefault(d1, {})
@@ -277,6 +290,14 @@ def load_delta_Q(path):
             result[qty_name].setdefault(d1, {})
             result[qty_name][d1].setdefault(d2, {})
             result[qty_name][d1][d2][d3] = data[key]
+        elif len(parts) == 5:
+            # delta_Q_terms.<a>.<b>.<c>.<term>
+            _, d1, d2, d3, tname = parts
+            result.setdefault(qty_name, {})
+            result[qty_name].setdefault(d1, {})
+            result[qty_name][d1].setdefault(d2, {})
+            result[qty_name][d1][d2].setdefault(d3, {})
+            result[qty_name][d1][d2][d3][tname] = data[key]
     return result, cfg
 
 

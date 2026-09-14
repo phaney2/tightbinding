@@ -408,9 +408,26 @@ calc:
   eflist: [2.0]
   kT: 0.1
   eta: 0.1                  # adiabatic broadening (band/subspace only)
+  save_kresolved: false     # also keep the per-k integrand (default false)
 ```
 Uses `_compute_dk_rmtx` (Sipe sum rule) borrowed from `nonlinear_optical.py`. Sign
 convention: code and PDFs use r = -i*v/w; dk_rmtx[c][a] = r^{c;a} (no sign flip).
+
+**k-resolved output (`save_kresolved`).** Off by default. On, the result dict and the
+`.npz` gain `delta_Q_k[a][b][c]` of shape `(nk1*nk2, nef)` — the **unweighted** per-k
+integrand, so `delta_Q_k.mean(axis=0) == delta_Q` (verified to 6e-19 on
+`input_delta_Q_test.yaml`, where the per-k values are O(1) and the average is a 1e-17
+symmetry zero) — plus `kpoints` `(nk1*nk2, 3)` Cartesian and `nk_grid` `[nk1, nk2]`.
+The k axis is C-ordered (kc1 outer, kc2 inner), so `dQk[:, ief].reshape(nk1, nk2)` is
+the map and `kpoints.reshape(nk1, nk2, 3)` its axes. Only the total is stored, not the
+term decomposition or the RTA piece. MPI-safe: `parallel.gather_array` undoes the
+round-robin scatter, and 4 ranks reproduce serial bit-for-bit. The gather puts a full
+copy on **every** rank — the engine prints the size and warns above 512 MiB. A
+non-boolean value raises. With the flag off, output is unchanged (verified: the
+`delta_Q`/`delta_Q_tau` arrays and the npz key set are identical).
+
+`main.load_delta_Q` also reads back `delta_Q_terms` now; its 5-part keys were written
+but silently dropped by the loader before.
 
 **Wannier input.** All three formulations use the same corrected position operator: the
 `subspace`/`band` pair integrands and `T_mix` are written in terms of the full interband

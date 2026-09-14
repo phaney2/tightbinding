@@ -565,6 +565,7 @@ calc:
   components: [xz, zx]      # (a,b) metric index pairs, or 'all'
   field_direction: x        # DC field direction c — string or list
   directions: [x, z]        # only needed when components: 'all'
+  save_kresolved: false     # also keep the per-k integrand (optional)
   outputfile: results/dQ
 ```
 
@@ -613,6 +614,32 @@ identically; it dies exponentially in a gapped system.
 - `result['delta_Q_tau'][a][b][c]` → same shape; thermal formulation only,
   per unit τ.
 - `result['Q_tilde']` is present but always empty.
+- With `save_kresolved: true`, three more (see below).
+
+**k-resolved output (`save_kresolved: true`).** Off by default. It adds the
+per-k integrand of `delta_Q`, so you can plot where in the BZ the response
+comes from:
+
+- `result['delta_Q_k'][a][b][c]` → complex array of shape `(nk1*nk2, nef)`.
+  It is **unweighted** — the `1/(nk1*nk2)` BZ factor is not applied — so
+  `delta_Q_k.mean(axis=0)` reproduces `delta_Q[a][b][c]`.
+- `result['kpoints']` → `(nk1*nk2, 3)`, Cartesian, same order.
+- `result['nk_grid']` → `[nk1, nk2]`.
+
+The k axis is C-ordered (`kc1` outer, `kc2` inner), so reshaping gives the map:
+
+```python
+nk1, nk2 = result['nk_grid']
+kxy = result['kpoints'].reshape(nk1, nk2, 3)
+dQk = result['delta_Q_k']['x']['z']['x'][:, 0].reshape(nk1, nk2)
+plt.pcolormesh(kxy[..., 0], kxy[..., 1], dQk.real, shading='nearest')
+```
+
+Only the total is stored per k — not the term decomposition, not
+`delta_Q_tau`. The arrays are gathered onto **every** MPI rank, so the memory
+cost is `16 * nk1*nk2 * nef` bytes per component *per rank*; the engine prints
+the size and warns above 512 MiB. Under MPI the gather restores grid order, so
+the output is identical to a serial run.
 
 **Reloading:**
 
@@ -622,10 +649,8 @@ result, cfg = load_delta_Q('results/dQ')
 # result['delta_Q']['x']['z']['x'] — array(nef,)
 ```
 
-Note: `load_delta_Q` returns `Q_tilde`, `delta_Q`, and `delta_Q_tau` (when it
-was computed). The per-term decomposition *is* written to the `.npz` under keys
-`delta_Q_terms.<a>.<b>.<c>.<term>`, but the loader drops them — read those
-directly with `np.load` if you need them.
+`load_delta_Q` returns `Q_tilde`, `delta_Q`, `delta_Q_terms`, and
+`delta_Q_tau` / `delta_Q_k` / `kpoints` / `nk_grid` when those were computed.
 
 **Sign convention.** The implemented formula corresponds to `H' = -E·r`. Notes
 written with `H' = +E·r` give the opposite overall sign; the two agree to

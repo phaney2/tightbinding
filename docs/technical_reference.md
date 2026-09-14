@@ -917,6 +917,17 @@ Eq. eq:final of `delta_Q_metal_finite_T.pdf` (metals at finite T),
 `delta_Q[a][b][c] -> array(nef,)`; plus `'delta_Q_tau'` (same nesting, **per
 unit τ**) with the thermal formulation. `Q_tilde` is always empty.
 
+With `calc.save_kresolved: true` it also returns `'delta_Q_k'[a][b][c] ->
+array(nk1*nk2, nef)` — the per-k integrand *before* the `1/(nk1*nk2)` weight,
+so `delta_Q_k.mean(axis=0) == delta_Q` — together with `'kpoints'`
+`(nk1*nk2, 3)` Cartesian and `'nk_grid'` `[nk1, nk2]`. The k axis follows
+`k_list` order (`kc1` outer, `kc2` inner), so a C-order reshape to
+`(nk1, nk2)` is the BZ map. Only the total is kept, not the term split or the
+RTA piece. Each rank fills its own `(n_local, nef)` slab and
+`parallel.gather_array` scatters them back into grid order, which makes the
+result independent of rank count but leaves a full copy on every rank — the
+engine prints the size and warns above 512 MiB. A non-boolean value raises.
+
 **Broadening — three distinct parameters, easily confused:**
 
 | symbol | where it enters |
@@ -987,10 +998,12 @@ Periodic spacing `db = b/nk`.
 `_assemble_delta_Q_rta` carry an explicit overall −1 relative to that note
 (pinned by the thermal/subspace ratio = +1 regression).
 
-**Serialization caveat:** `_save_delta_Q` writes the term decomposition under
-5-part keys `delta_Q_terms.<a>.<b>.<c>.<term>`, but `load_delta_Q` only handles
-3- and 4-part keys, so those entries are silently dropped on reload. Read them
-with `np.load` directly.
+**Serialization:** `_save_delta_Q` writes the term decomposition under 5-part
+keys `delta_Q_terms.<a>.<b>.<c>.<term>` and the k-resolved output under 4-part
+keys `delta_Q_k.<a>.<b>.<c>` plus the bare keys `kpoints` / `nk_grid`.
+`load_delta_Q` handles 1-, 3-, 4- and 5-part keys, so all of it round-trips.
+(Before 2026-09-13 the loader handled only 3- and 4-part keys and silently
+dropped `delta_Q_terms` on reload.)
 
 ---
 

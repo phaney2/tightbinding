@@ -147,6 +147,13 @@ def compute_delta_Q(system: System, cfg: dict) -> dict:
     dict with keys 'Q_tilde' (empty) and 'delta_Q'.
       delta_Q[a][b][c] -> array(nef,)  where (a,b) are metric indices,
                                         c is DC field direction
+
+    With calc.save_kresolved the dict also carries the per-k integrand:
+      delta_Q_k[a][b][c] -> array(nk1*nk2, nef), unweighted, so that
+                            delta_Q[a][b][c] == delta_Q_k[a][b][c].mean(0)
+      kpoints             -> array(nk1*nk2, 3), Cartesian, same order
+      nk_grid             -> array([nk1, nk2]); the k axis is C-ordered,
+                             so .reshape(nk1, nk2, nef) gives the map
     """
     calc = cfg['calc']
     nk1, nk2 = calc['nk']
@@ -198,6 +205,17 @@ def compute_delta_Q(system: System, cfg: dict) -> dict:
             "tau as 'delta_Q_tau' — multiply by your relaxation time."
         )
     with_tau = (formulation == 'thermal')
+
+    # Optional k-resolved output: keep the per-k integrand of delta_Q,
+    # before the 1/(nk1*nk2) BZ weight, so it can be plotted as a map.
+    # Off by default — it is an (nk1*nk2, nef) complex array per component
+    # and the gather puts a full copy on every rank.
+    save_kresolved = calc.get('save_kresolved', False)
+    if not isinstance(save_kresolved, bool):
+        raise ValueError(
+            "delta_Q: 'save_kresolved' must be true or false, got "
+            f"{save_kresolved!r}"
+        )
 
     # The thermal path has no adiabatic iη — finite kT is the regulator.
     global _ETA_THERMAL_WARNED
@@ -269,6 +287,21 @@ def compute_delta_Q(system: System, cfg: dict) -> dict:
         f"  Delta Q: {total_jobs} k-points on {parallel.size} rank(s)"
     )
 
+    if save_kresolved:
+        n_comp = len(ab_pairs) * len(field_dirs)
+        nbytes = 16 * total_jobs * nef * n_comp
+        parallel.print_root(
+            f"  k-resolved output on: delta_Q_k is {n_comp} x "
+            f"({total_jobs}, {nef}) complex, {nbytes / 2**20:.1f} MiB "
+            f"on every rank"
+        )
+        if nbytes > 512 * 2**20:
+            parallel.print_root(
+                "  [delta_Q] WARNING: the k-resolved arrays are gathered "
+                "onto every rank; consider a coarser nk, fewer components "
+                "or fewer Fermi energies."
+            )
+
     my_indices, my_klist = parallel.scatter_work(k_list)
 
     # Term names depend on the formulation:
@@ -299,6 +332,18 @@ def compute_delta_Q(system: System, cfg: dict) -> dict:
             for c in field_dirs:
                 local_dQ_tau[a][b][c] = np.zeros(nef, dtype=complex)
 
+    # Per-k integrand, this rank's share; gathered in grid order below.
+    local_dQ_k = None
+    if save_kresolved:
+        local_dQ_k = {}
+        for ab in ab_pairs:
+            a, b = ab
+            local_dQ_k.setdefault(a, {})
+            local_dQ_k[a].setdefault(b, {})
+            for c in field_dirs:
+                local_dQ_k[a][b][c] = np.zeros((len(my_klist), nef),
+                                               dtype=complex)
+
     warnings.filterwarnings('ignore', category=RuntimeWarning)
 
     for i, tk in enumerate(my_klist):
@@ -324,6 +369,8 @@ def compute_delta_Q(system: System, cfg: dict) -> dict:
                     local_dQ_terms[a][b][c][t] += kpt_terms[a][b][c][t] * norm
                 if local_dQ_tau is not None:
                     local_dQ_tau[a][b][c] += kpt_tau[a][b][c] * norm
+                if local_dQ_k is not None:
+                    local_dQ_k[a][b][c][i] = kpt[a][b][c]
 
     # Reduce across all ranks
     delta_Q_terms = {}
@@ -353,6 +400,21 @@ def compute_delta_Q(system: System, cfg: dict) -> dict:
               'delta_Q_terms': delta_Q_terms}
     if delta_Q_tau is not None:
         result['delta_Q_tau'] = delta_Q_tau
+
+    if local_dQ_k is not None:
+        delta_Q_k = {}
+        for ab in ab_pairs:
+            a, b = ab
+            delta_Q_k.setdefault(a, {})
+            delta_Q_k[a].setdefault(b, {})
+            for c in field_dirs:
+                delta_Q_k[a][b][c] = parallel.gather_array(
+                    my_indices, local_dQ_k[a][b][c], total_jobs
+                )
+        result['delta_Q_k'] = delta_Q_k
+        result['kpoints'] = np.asarray(k_list, dtype=float)
+        result['nk_grid'] = np.array([nk1, nk2], dtype=int)
+
     return result
 
 
