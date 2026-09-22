@@ -20,7 +20,11 @@ applied by `apply_wannier_correction` to every operator an engine forms:
 
 while everything that is a derivative of H(k) itself — the group velocity
 Delta, the Sipe sum rule, the band curvature, the inverse mass — keeps the
-bare v.  The rule that fixes which is which: **every engine output must be
+bare v.  An engine written in projectors rather than band matrix elements
+(`calc/skewness.py`) takes the same correction in a second, equivalent form:
+`covariant_H_derivatives` replaces ∂_a by the covariant D_a = ∂_a − i[A^(W)_a, ·]
+on H(k), which in the band basis is exactly the vbar + i w a above.
+The rule that fixes which is which: **every engine output must be
 independent of the gauge the system was built in** (its atompos).
 `examples/test_wannier_gauge.py` enforces that exactly, by re-expressing
 point-like models in other gauges (where A^(W) is then a known diagonal) and
@@ -395,3 +399,62 @@ def apply_wannier_correction(A_W, dA_W, psi, rmtx, dir_chars,
                              "together with vmtx")
         v_new = {d: vmtx[d] + 1j * de_mtx * a_H[d] for d in dir_chars}
     return r_new, corr, v_new
+
+
+def covariant_H_derivatives(A_W, dA_W, H, vtb, dir_chars):
+    """First and second covariant k-derivatives of H(k) in the Wannier gauge.
+
+    For an engine that works with projectors P(k) rather than band matrix
+    elements, the whole Wannier-gauge correction is the replacement
+
+        ∂_a  ->  D_a = ∂_a - i [A^(W)_a, ·]
+
+    on every N x N operator.  D_a is a derivation, so every identity derived
+    from [H, P] = 0 by differentiating survives with D in place of ∂; the
+    engine then needs only D_a H and D_b D_c H:
+
+        V^a    = ∂_a H - i [A_a, H]
+        W^{bc} = ∂_b ∂_c H - i [∂_b A_c, H] - i [A_c, ∂_b H] - i [A_b, V^c]
+
+    In the band basis V^a_nm = vbar^a_nm + i w_nm a^a_nm with the diagonal
+    bare — the same current vertex `apply_wannier_correction` returns — so
+    this is the same physics in a different bookkeeping, and the
+    gauge-covariance certificate applies to it unchanged
+    (`examples/test_skewness.py`).  Note [D_b, D_c] = -i [F_bc, ·] with
+    F the curvature of A^(W): W^{bc} is not symmetric in b <-> c when the
+    Wannier connection has curvature (a truncated Wannier basis generally
+    does — the same F behind the a != c chi^(2)/delta_Q sum-rule offset).
+    The caller decides how to symmetrize.
+
+    Parameters
+    ----------
+    A_W, dA_W : from `compute_A_W_k(..., need_deriv=True)`; ``dA_W[c][b]``
+        is ∂_b A_c.  Both None -> the bare derivatives are returned as-is.
+    H : H(k) in the Wannier/orbital basis
+    vtb : the `get_H_v(..., order=2)` dict, ``vtb['x']``, ``vtb['xy']``, ...
+
+    Returns
+    -------
+    (V, W) with ``V[a]`` and ``W[b][c]`` in the orbital basis.
+    """
+    if A_W is None:
+        V = {d: vtb[d] for d in dir_chars}
+        W = {b: {c: vtb[b + c] for c in dir_chars} for b in dir_chars}
+        return V, W
+    if dA_W is None:
+        raise ValueError("covariant_H_derivatives needs dA_W; call "
+                         "compute_A_W_k with need_deriv=True")
+
+    def comm(X, Y):
+        return X @ Y - Y @ X
+
+    V = {d: vtb[d] - 1j * comm(A_W[d], H) for d in dir_chars}
+    W = {}
+    for b in dir_chars:
+        W[b] = {}
+        for c in dir_chars:
+            W[b][c] = (vtb[b + c]
+                       - 1j * comm(dA_W[c][b], H)
+                       - 1j * comm(A_W[c], vtb[b])
+                       - 1j * comm(A_W[b], V[c]))
+    return V, W

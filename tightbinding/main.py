@@ -132,6 +132,13 @@ def _dispatch(system, cfg, calc_type):
             _save_delta_Q(result, cfg)
         return result
 
+    elif calc_type == 'skewness':
+        from .calc.skewness import compute_skewness
+        result = compute_skewness(system, cfg)
+        if parallel.is_root():
+            _save_skewness(result, cfg)
+        return result
+
     elif calc_type == 'all_ek':
         from .calc.all_ek import compute_all_ek, plot_all_ek
         result = compute_all_ek(system, cfg)
@@ -221,6 +228,50 @@ def load_quantum_metric(path):
             result[qty_name].setdefault(d1, {})
             result[qty_name][d1].setdefault(d2, {})
             result[qty_name][d1][d2][d3] = data[key]
+    return result, cfg
+
+
+def _save_skewness(result, cfg):
+    """Save skewness results + config to .npz."""
+    output_file = cfg.get('calc', {}).get('outputfile')
+    flat = {}
+    for qty_name in ('variance', 'skewness', 'skewness_sym'):
+        qty = result[qty_name]
+        for d1, v1 in qty.items():
+            for d2, v2 in v1.items():
+                if isinstance(v2, np.ndarray):
+                    flat[f"{qty_name}.{d1}.{d2}"] = v2
+                else:
+                    for d3, arr in v2.items():
+                        flat[f"{qty_name}.{d1}.{d2}.{d3}"] = arr
+    flat['gap'] = np.asarray(result['gap'])
+    flat['n_occ'] = np.asarray(result['n_occ'])
+    _save_npz(output_file, flat, cfg)
+
+
+def load_skewness(path):
+    """Load skewness results from .npz.
+
+    Returns (result_dict, config_dict) with keys 'variance', 'skewness',
+    'skewness_sym', 'gap', 'n_occ'.
+    """
+    data, cfg = _load_npz(path)
+    result = {'variance': {}, 'skewness': {}, 'skewness_sym': {}}
+    for key in data.files:
+        if key.startswith('_'):
+            continue
+        parts = key.split('.')
+        if len(parts) == 1:
+            result[key] = data[key]
+        elif len(parts) == 3:
+            q, d1, d2 = parts
+            result[q].setdefault(d1, {})
+            result[q][d1][d2] = data[key]
+        elif len(parts) == 4:
+            q, d1, d2, d3 = parts
+            result[q].setdefault(d1, {})
+            result[q][d1].setdefault(d2, {})
+            result[q][d1][d2][d3] = data[key]
     return result, cfg
 
 

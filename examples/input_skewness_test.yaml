@@ -1,0 +1,59 @@
+# =====================================================================
+# Polarization cumulants (variance and skewness of the ground-state
+# position distribution) of gapped graphene -- arXiv:2409.16358 Eqs. 12-13,
+# reported as the real-space cumulants (skewness = -(paper Eq. 13); see
+# CLAUDE.md "Skewness Engine").
+#
+# Run:
+#     python3 -m tightbinding examples/input_skewness_test.yaml
+#     mpiexec -np 8 python3 -m tightbinding examples/input_skewness_test.yaml
+#
+# Same model as examples/honeycomb_warp/ (A-B bond along +y).  Nothing
+# else is needed: no kT, eta or eta_sos enter the cumulants (they are
+# analytic BZ integrals of an insulator's projector), and the uniform
+# grid converges exponentially -- the error squares when nk doubles.
+# =====================================================================
+
+system:
+  basis: s_u
+  lattice_vectors:
+    - [ 0.8660254037844386, -1.5, 0.0]
+    - [ 0.8660254037844386,  1.5, 0.0]
+    - [ 0.0,                 0.0, 20.0]
+  positions:
+    - {species: A, coord: [0.0, 0.0, 0.0]}
+    - {species: B, coord: [0.0, 1.0, 0.0]}
+
+hopping:
+  range: 1.1
+  tss_sigma: 1.0
+
+onsite:
+  A: {u_s:  0.1}                  # +m
+  B: {u_s: -0.1}                  # -m  =>  gap = 0.2
+
+calc:
+  type: skewness
+  directions: [x, y]
+  nk: [240, 240]                  # 1e-12 converged at m = 0.1 (nk = 60 at m = 0.4)
+  eflist: [0.0]                   # mid-gap; the engine refuses a metallic ef
+  outputfile: honeycomb_skewness_m0.1
+
+# =====================================================================
+# EXPECTED (m = 0.1, nk = 240; units of the NN distance a = 1, per cell):
+#
+#   variance   xx = yy = 0.38151888,  xy = 0
+#   skewness   yyy = -0.10080004,  xxy = xyx = yxx = +0.10080004   (C3)
+#              xxx = xyy = yxy = yyx = 0                          (M_x)
+#
+# Total symmetry in (a,b,c) is exact for point-like orbitals, so the
+# printed "b<->c antisymmetric part" and "(a,b,c) asymmetry" are ~1e-15.
+# Negative yyy: weight piles up toward +y (the B site at (0, a)) for
+# m > 0, i.e. the occupied state sits mostly on the lower-energy B site,
+# with the tail toward -y.
+#
+#   import numpy as np
+#   from tightbinding.main import load_skewness
+#   res, cfg = load_skewness('honeycomb_skewness_m0.1')
+#   print(res['skewness']['y']['y']['y'][0], res['variance']['x']['x'][0])
+# =====================================================================

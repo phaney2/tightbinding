@@ -49,6 +49,7 @@ tightbinding/
     wannier_gauge.py      — Wannier-gauge position correction: the one switch + the one kernel
     quantum_metric.py     — quantum metric tensor + linear response
     delta_Q.py            — DC field-induced change in quantum geometric tensor
+    skewness.py           — polarization cumulants: variance + third cumulant (skewness)
   nrl/
     params.py          — NRL parameter file parser
     hamiltonian_nrl.py — NRL Hamiltonian builder (density-dependent on-site, SOC)
@@ -112,6 +113,7 @@ Common workflow: user provides a PDF with derivations, Claude reads the equation
 - `examples/input_delta_Q_metal.yaml` — delta Q of a *metal* (thermal formulation + RTA piece)
 - `examples/input_jdos_test.yaml` — joint density of states (2D square sp_u)
 - `examples/input_nonlinear_freq_integral.yaml` — analytic frequency-integrated chi^(2)
+- `examples/input_skewness_test.yaml` — polarization variance + skewness (gapped honeycomb)
 - `examples/input_MoS2_bands.yaml` — MoS2 monolayer 11-band model (Mo d_u + S p_u, Cappelluti params)
 
 ## Validated Benchmarks
@@ -135,6 +137,11 @@ Common workflow: user provides a PDF with derivations, Claude reads the equation
   == subspace to 1e-6, sub-gap Re chi^(2) ∝ eta (ratio 0.1275 over an 8x ladder vs 0.125).
 - Gapped graphene / trigonal warping (`examples/honeycomb_warp/`): reproduces the warped-valley
   model of `tmd_warping_note_corrected.pdf` (Eq. 1) and its delta_Q predictions — see below
+- Skewness (`examples/test_skewness.py`, 34 checks): exact Bernoulli cumulants of the decoupled
+  dimer at 1e-15, the paper's Rice–Mele (elliptic) and stub-SSH (three-band) closed forms at
+  1e-15, finite differences of P(k) at h² convergence (incl. an exactly spin-degenerate model),
+  the r/r^{b;c} band form at 1e-16, BZ total symmetry and C3 at 1e-13, variance == Q at 1e-16,
+  gauge covariance at 6e-15 (control fails by 30-150%), MoS2 atomic vs lattice gauge 7e-15.
 
 ## chi^(2) No Longer Matches MATLAB (deliberately)
 As of `8b5a079`, the chi^(2) engine **diverges from the MATLAB original by design**. The port
@@ -454,6 +461,68 @@ precision; insulator limit == subspace at 2e-16.
 
 **Position operator gauge.** `bloch.py` builds H(k) in the *atomic gauge*, exp(ik·(R + tau_j - tau_i)) via `atompos`, for every input: atom coordinates for TB_simple, Wannier centres for `_tb.dat` (always, since 2026-09-10). For point-like orbitals the TBA position operator in that gauge is exactly r = -i*v/w with zero intra-cell term, so `compute_A_W_k` correctly returns None for TB_simple systems even in multi-atom cells; for Wannier functions the finite-spread part is what the correction adds (see "Wannier-Gauge Position Correction" below). k·p expansions of `get_H_k` output should therefore be done in the atomic gauge too.
 
+## Skewness Engine (polarization cumulants)
+
+`calc.type: skewness`, `calc/skewness.py`. The variance and third cumulant (skewness) of the
+ground-state polarization per unit cell — arXiv:2409.16358 Eqs. 12-13, with P = P_occ(k):
+
+    variance^{ab} = <X_a X_b>_c     =  V∫_k Re tr[P (∂_a P)(∂_b P)]         (= the quantum metric Q)
+    skewness^{abc} = <X_a X_b X_c>_c = -V∫_k Im tr[P (∂_a P)(∂_b ∂_c P)]
+
+**Sign: `skewness = −(paper Eq. 13)`.** Eq. 13 has no minus sign, but on the paper's own
+fully dimerized Rice–Mele chain (decoupled dimers, sites at 0 and 1/2) the electron distribution
+is exactly Bernoulli with κ3 = q(1−q)(1−2q)/8 = −m/(8(4+m²)^{3/2}), while the literal Eq. 13
+gives +m/(8(4+m²)^{3/2}) — checked in the code's Bloch convention, which is the paper's
+(H_AB = (1+δ)e^{ik/2} + (1−δ)e^{−ik/2}). The engine reports the real-space cumulant; to compare
+with the paper's tables flip the sign of the skewness (their MoS2 TNN-GGA Skew = −0.119 a³ is a
++0.119 here). Negative skewness = weight piled up at +x with the tail toward −x. Decided 2026-09-21.
+
+**Formula.** Not the r / r^{b;c} expansion (which carries 1/w between two *occupied* bands,
+cancelling only algebraically — `eta_sos` would break it). Instead differentiate [H, P] = 0 in
+the band basis; only occupied–unoccupied denominators appear:
+
+    (∂_a P)_pq     = f_pq V^a_pq / (E_p − E_q)
+    (∂_b ∂_c P)_pq = [ f_pq W^{bc}_pq − ([V^b, ∂_c P] + [V^c, ∂_b P])_pq ] / (E_p − E_q)
+
+No `eta_sos`, no `eta`, no `kT` (all three are ignored with a note): the integrand is analytic
+and periodic, so the uniform grid converges **exponentially** — the error squares when nk
+doubles (honeycomb m = 0.1: 2e-2, 6e-4, 6e-7, 5e-13 at nk = 30/60/120/240; m = 0.4 is 2e-13 at
+nk = 60). Sharp occupation `E < ef`; **insulators only** — the engine raises if the occupied
+count varies over the grid. O(N³) per k. Orthogonal basis only (NRL overlap raises).
+
+**Wannier input.** ∂_a → D_a = ∂_a − i[A^W_a, ·] on H(k) (`wannier_gauge.covariant_H_derivatives`
+gives V^a = D_aH and W^{bc} = D_bD_cH); in the band basis that is the same vbar + i w a as the
+table below, so the output is independent of the orbital centres (certificate in the test).
+Two caveats: (i) [D_b, D_c] = −i[F_bc, ·], so with a truncated Wannier basis (curvature F ≠ 0,
+the same F as in the chi^(2)↔delta_Q sum-rule offset) T^{a;bc} is not b↔c symmetric and the
+BZ integral is not totally symmetric in (a,b,c). The engine symmetrizes b↔c, also returns the
+fully symmetrized `skewness_sym`, and prints both antisymmetric remainders (exactly zero for
+point-like orbitals; 1.4% and 1% of |T| on MoS2). (ii) It is the skewness of the position
+operator *projected onto the Wannier manifold* — the exact cumulant would need <0n|r_a r_b|Rm>,
+which `_tb.dat` does not carry.
+
+**MoS2 numbers (2026-09-21, `mos2_tb.dat` + centres, ef = 0, 7 occupied bands, Å units;
+converged to all digits at nk = 60):** correction on: variance xx = 3.48982, yy = 3.48171;
+skewness yyy = −1.02267, xxy = xyx = 1.01573, yxx = 1.03045 (fully symmetrized 1.02063), M_x-odd
+components ≤ 0.010. Correction off: xx = 3.74633, yy = 3.61813; yyy = −1.04120, xxy = 0.99315,
+M_x-odd ≤ 1e-5. The correction is a 4–7% effect on the variance, 2% on the skewness. **The C3
+breaking is the file's, not the engine's**: the Wannier centres are not on the atomic sites
+(the Mo-like WFs sit at y = 1.708…1.938 Å around Mo at 1.824, x = 0 exactly; S-like likewise),
+i.e. the WFs are M_x- but not C3-symmetric individually, so the point-like model is 3.5%
+anisotropic and even with the correction the chain yyy = −xxy holds only to ~1%. H(k) itself
+breaks C3 by only 5e-4 eV in band energies. A symmetry-adapted Wannierization would fix this.
+
+Config / output:
+```yaml
+calc:
+  type: skewness
+  directions: [x, y]        # default
+  nk: [240, 240]            # 2 or 3 entries
+  eflist: [0.0]
+  outputfile: skew          # variance.a.b, skewness.a.b.c, skewness_sym.a.b.c, gap, n_occ
+```
+`main.load_skewness` reads it back. Test: `examples/test_skewness.py [MoS2 dir]`.
+
 ## Wannier-Gauge Position Correction (`system.wannier_r`)
 
 One switch, one kernel, one application function, in `calc/wannier_gauge.py`. Every engine
@@ -488,6 +557,7 @@ tau the sum is exactly tau_n δ_nm and A^W = 0.
 | current vertex v (interband) | vbar_nm + i w_nm a_nm  (v = i[H, r] with the full r) | chi^(2) |
 | projector-derivative factors v/w | i r (full) | delta_Q subspace/band |
 | perturbation vertex | full r | quantum_metric |
+| D_aH, D_bD_cH (covariant derivatives; = vbar + i w a off-diagonal, bare diagonal) | `covariant_H_derivatives` | skewness |
 | Delta = v_nn − v_mm, band curvature, inverse mass, the Sipe sum rule's own v's | **bare** v | all |
 
 The rule that decides the table: **every engine output must be independent of the gauge the
@@ -533,8 +603,9 @@ unified); a non-boolean value raises. `config.load_config` runs the same validat
 pre-fix code. `_tb.dat` results change (that is the point); `wannier_r: false` results on
 `_tb.dat` input *without* a centres file change too, because they were in the lattice
 gauge before. Tests: `examples/test_wannier_gauge.py` (the certificates; pass the MoS2
-directory as argv[1] to include the real-data section) and
-`examples/test_wannier_r_flag.py` (31 checks on the switch itself).
+directory as argv[1] to include the real-data section),
+`examples/test_wannier_r_flag.py` (31 checks on the switch itself) and
+`examples/test_skewness.py` (the covariant-derivative form, same certificate).
 
 ## MATLAB Source Reference
 The original MATLAB code (`master_response`) is the reference when porting and validating.
