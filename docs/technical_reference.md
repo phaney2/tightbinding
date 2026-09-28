@@ -913,9 +913,10 @@ Eq. eq:final of `delta_Q_metal_finite_T.pdf` (metals at finite T),
 > operator is exactly `r = -i v/ω` with no intra-cell correction, so
 > `compute_A_W_k` correctly returns `None`.
 
-**Returns** `{'Q_tilde': {}, 'delta_Q': ..., 'delta_Q_terms': ...}` with
-`delta_Q[a][b][c] -> array(nef,)`; plus `'delta_Q_tau'` (same nesting, **per
-unit τ**) with the thermal formulation. `Q_tilde` is always empty.
+**Returns** `{'Q_tilde': {}, 'delta_Q': ..., 'delta_Q_terms': ...,
+'delta_Q_groups': ...}` with `delta_Q[a][b][c] -> array(nef,)`; plus
+`'delta_Q_tau'` (same nesting, **per unit τ**) with the thermal formulation.
+`Q_tilde` is always empty.
 
 With `calc.save_kresolved: true` it also returns `'delta_Q_k'[a][b][c] ->
 array(nk1*nk2, nef)` — the per-k integrand *before* the `1/(nk1*nk2)` weight,
@@ -981,6 +982,40 @@ thermal path has its own assembly (the weights differ in *structure*, not just
 mask) but is pinned to the others by the insulator-limit regression in
 `examples/test_dQ_thermal.py`.
 
+#### `group_terms(terms) -> dict` and `NOTE_GROUPS`
+
+Regroups one `delta_Q_terms[a][b][c]` dict into the three pieces of Eq. 1
+(metric part Eq. 17) of `delta_Q_multiband_expansion.pdf`:
+
+| group | pieces | engine terms |
+|---|---|---|
+| `connection` | (i) `i Σ r^a_pq r^{c;b}_qp / ω_pq` | `T_Sipe_Delta`, `T_Sipe_d2H`, `T_Sipe_3band`, `T_Sipe_wannier_corr` |
+| `gap_gradient` | (ii) `i Σ ∂_b(1/ω_pq) r^a_pq r^c_qp` | `T_Delta` |
+| `three_band` | (iii) closed three-band position loops | `T_3band`, `T_mix`, `T_loop` |
+
+The note's partition and the engine's are **the same**, despite the names:
+`T_Sipe_3band` is the three-band sum *inside* the Sipe generalized derivative
+and belongs to (i), while the genuine three-band loop is split across
+`T_3band` / `T_mix` / `T_loop` by the occupation of the intermediate band.
+`T_Delta` is (ii) because `Δ^b_pq = v^b_pp - v^b_qq` is exactly `∂_b ω_pq`.
+Group names absent from `terms` are skipped, so the three groups always sum to
+the same total as the input.
+
+`compute_delta_Q` calls this for every component and returns the result as
+`delta_Q_groups[a][b][c][group]`; `_save_delta_Q` writes it under the same
+5-part key shape as `delta_Q_terms` and `load_delta_Q` reads it back. For a
+file written before 2026-09-25, call `group_terms` on the loaded
+`delta_Q_terms` instead.
+
+Verified piece by piece to 3e-16 against a direct band-basis evaluation of
+Eq. 1 in `examples/test_dQ_term_groups.py` (25 checks: group bookkeeping, a
+two-band control where (iii) is identically zero, a four-band insulator where
+all three are alive, both `subspace` and `thermal`, and the `.npz` round
+trip). `examples/dQ_term_groups.py` prints the BZ-summed table for a model.
+Caveat recorded there: on MoS2 the *total* is insensitive to `eta_sos` but the
+(i)/(iii) split is not, because those two pieces cancel — converge `eta_sos`
+below 1e-4 before quoting a split.
+
 **Term names:** `T_Sipe_Delta`, `T_Sipe_d2H`, `T_Sipe_3band`,
 `T_Sipe_wannier_corr`, `T_Delta`, `T_3band` (+ `T_mix` in the subspace path,
 + `T_loop` in the thermal path — the finite-T triple sum, dead at T=0; the
@@ -998,9 +1033,10 @@ Periodic spacing `db = b/nk`.
 `_assemble_delta_Q_rta` carry an explicit overall −1 relative to that note
 (pinned by the thermal/subspace ratio = +1 regression).
 
-**Serialization:** `_save_delta_Q` writes the term decomposition under 5-part
-keys `delta_Q_terms.<a>.<b>.<c>.<term>` and the k-resolved output under 4-part
-keys `delta_Q_k.<a>.<b>.<c>` plus the bare keys `kpoints` / `nk_grid`.
+**Serialization:** `_save_delta_Q` writes the term decomposition and its
+three-piece regrouping under 5-part keys `delta_Q_terms.<a>.<b>.<c>.<term>`
+and `delta_Q_groups.<a>.<b>.<c>.<group>`, and the k-resolved output under
+4-part keys `delta_Q_k.<a>.<b>.<c>` plus the bare keys `kpoints` / `nk_grid`.
 `load_delta_Q` handles 1-, 3-, 4- and 5-part keys, so all of it round-trips.
 (Before 2026-09-13 the loader handled only 3- and 4-part keys and silently
 dropped `delta_Q_terms` on reload.)

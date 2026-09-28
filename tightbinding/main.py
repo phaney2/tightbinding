@@ -293,14 +293,16 @@ def _save_delta_Q(result, cfg):
                 else:
                     for d3, arr in v2.items():
                         flat[f"{qty_name}.{d1}.{d2}.{d3}"] = arr
-    # Save per-term decomposition if present
-    if 'delta_Q_terms' in result:
-        qty = result['delta_Q_terms']
+    # Save per-term decomposition and its 3-piece regrouping if present
+    for qty_name in ('delta_Q_terms', 'delta_Q_groups'):
+        if qty_name not in result:
+            continue
+        qty = result[qty_name]
         for d1, v1 in qty.items():
             for d2, v2 in v1.items():
                 for d3, v3 in v2.items():
                     for tname, arr in v3.items():
-                        flat[f"delta_Q_terms.{d1}.{d2}.{d3}.{tname}"] = arr
+                        flat[f"{qty_name}.{d1}.{d2}.{d3}.{tname}"] = arr
     # k-grid that indexes the first axis of delta_Q_k
     for key in ('kpoints', 'nk_grid'):
         if key in result:
@@ -312,7 +314,11 @@ def load_delta_Q(path):
     """Load delta Q results from .npz.
 
     Returns (result_dict, config_dict).
-    result_dict has keys 'Q_tilde', 'delta_Q', 'delta_Q_terms', and
+    result_dict has keys 'Q_tilde', 'delta_Q', 'delta_Q_terms',
+    'delta_Q_groups' (the terms regrouped into the connection /
+    gap-gradient / three-band pieces of delta_Q_multiband_expansion.pdf;
+    see calc.delta_Q.group_terms, which reconstructs it from
+    'delta_Q_terms' for files written before 2026-09-25), and
     'delta_Q_tau' when the RTA transport piece was computed (thermal
     formulation; the values are per unit relaxation time).
 
@@ -343,6 +349,7 @@ def load_delta_Q(path):
             result[qty_name][d1][d2][d3] = data[key]
         elif len(parts) == 5:
             # delta_Q_terms.<a>.<b>.<c>.<term>
+            # delta_Q_groups.<a>.<b>.<c>.<group>
             _, d1, d2, d3, tname = parts
             result.setdefault(qty_name, {})
             result[qty_name].setdefault(d1, {})

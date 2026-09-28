@@ -7,3 +7,13 @@ CLAUDE.local.md
 
 # Machine-specific VS Code interpreter path (launch.json is portable, keep it)
 .vscode/settings.json
+
+# Local example/driver work, not tracked
+examples/dQ_term_groups.py
+examples/test_dQ_term_groups.py
+examples/liu_tmd/
+examples/mos2_skewness/
+
+# Reference PDFs and Windows download metadata
+*.pdf
+*:Zone.Identifier

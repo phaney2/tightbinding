@@ -111,6 +111,69 @@ def _term_names(formulation):
     return list(_TERM_NAMES_BAND)
 
 
+# Regrouping of the T_* terms into the three pieces of Eq. 1 / Eq. 17 of
+# delta_Q_multiband_expansion.pdf.  Verified to 2e-16 per piece against a
+# direct band-basis evaluation of Eq. 1, on a 2-band and a 4-band insulator,
+# for both the 'subspace' and 'thermal' assemblies (see
+# examples/test_dQ_term_groups.py).
+#
+#   connection    (i)   i Σ_pq r^a_pq r^{c;b}_qp / ω_pq
+#                       the shift-current matrix element with a 1/ω weight.
+#                       This is the WHOLE Sipe generalized derivative, so
+#                       T_Sipe_3band — the three-band sum *inside* r^{c;b} —
+#                       belongs here, NOT under 'three_band'.
+#   gap_gradient  (ii)  i Σ_pq ∂_b(1/ω_pq) r^a_pq r^c_qp
+#                       ∂_b ω_pq = v^b_pp - v^b_qq = Δ^b_pq, which is why the
+#                       code term is called T_Delta.  Since
+#                       Im(r^a_pq r^c_qp) = -Ω^{qp}_ac/2, in the metric part
+#                       this is (gap gradient) x (two-state Berry curvature) —
+#                       the "Berry-curvature dipole" piece, whose dipole form
+#                       follows from an integration by parts that is not
+#                       needed numerically (only the BZ integral is used).
+#   three_band    (iii) Σ_pq (r^c_qp/ω_pq) [Σ_{q'≠q} r^a_pq' r^b_q'q
+#                                           - Σ_{p'≠p} r^a_p'q r^b_pp']
+#                       closed three-band loops of position matrix elements.
+#                       Identically zero for two bands.  The engine splits it
+#                       by the occupation of the intermediate band, so all of
+#                       T_3band / T_mix / T_loop land here.
+NOTE_GROUPS = {
+    'connection': ('T_Sipe_Delta', 'T_Sipe_d2H', 'T_Sipe_3band',
+                   'T_Sipe_wannier_corr'),
+    'gap_gradient': ('T_Delta',),
+    'three_band': ('T_3band', 'T_mix', 'T_loop'),
+}
+
+
+def group_terms(terms):
+    r"""Regroup a `delta_Q_terms[a][b][c]` dict into the note's 3 pieces.
+
+    `terms` maps term name -> array(nef,) (or any addable value).  Returns
+    {'connection': ..., 'gap_gradient': ..., 'three_band': ...}; names absent
+    from `terms` (T_mix / T_loop, depending on the formulation) are skipped,
+    and the three groups sum to the same total as the input.
+
+    The grouping reproduces Eq. 1 of `delta_Q_multiband_expansion.pdf` piece
+    by piece for the T=0 insulator, up to the engine's overall -1 (H' = -E·r
+    against the note's δH = +r^c).  The note's own δQ = F^ab + F^ba is loose:
+    its Eq. 18 for δΩ requires F^ab + (F^ba)*, which is what the engine
+    computes; Eq. 17 for the metric part δg is unaffected either way.
+
+    On the `band` formulation the pieces are still the ones assembled from
+    the same pair integrands, but the object being decomposed is
+    Σ_n f_n δQ_n, not the occupied-projector δQ the note derives.
+    """
+    out = {}
+    for group, names in NOTE_GROUPS.items():
+        present = [terms[t] for t in names if t in terms]
+        if not present:
+            continue
+        acc = present[0]
+        for x in present[1:]:
+            acc = acc + x
+        out[group] = acc
+    return out
+
+
 def _resolve_formulation(formulation, dQ_occupied_subspace):
     """Resolve the formulation name from the new and legacy config keys."""
     if formulation is not None and dQ_occupied_subspace is not None:
@@ -396,8 +459,21 @@ def compute_delta_Q(system: System, cfg: dict) -> dict:
                     local_dQ_tau[a][b][c]
                 )
 
+    # Eq. 1 / Eq. 17 of delta_Q_multiband_expansion.pdf: connection,
+    # gap gradient (Berry-curvature dipole) and three-band loops.  Pure
+    # regrouping of delta_Q_terms, kept alongside it so a run is
+    # self-describing; group_terms() does the same for a loaded result.
+    delta_Q_groups = {}
+    for ab in ab_pairs:
+        a, b = ab
+        delta_Q_groups.setdefault(a, {})
+        delta_Q_groups[a].setdefault(b, {})
+        for c in field_dirs:
+            delta_Q_groups[a][b][c] = group_terms(delta_Q_terms[a][b][c])
+
     result = {'Q_tilde': {}, 'delta_Q': delta_Q,
-              'delta_Q_terms': delta_Q_terms}
+              'delta_Q_terms': delta_Q_terms,
+              'delta_Q_groups': delta_Q_groups}
     if delta_Q_tau is not None:
         result['delta_Q_tau'] = delta_Q_tau
 

@@ -611,6 +611,9 @@ identically; it dies exponentially in a gapped system.
 - `result['delta_Q_terms'][a][b][c][term]` → same shape, per-term breakdown.
   Terms: `T_Sipe_Delta`, `T_Sipe_d2H`, `T_Sipe_3band`, `T_Sipe_wannier_corr`,
   `T_Delta`, `T_3band`, plus `T_mix` (subspace) or `T_loop` (thermal).
+- `result['delta_Q_groups'][a][b][c][group]` → same shape, those terms
+  regrouped into the three pieces of Eq. 1 / Eq. 17 of
+  `delta_Q_multiband_expansion.pdf` (see below).
 - `result['delta_Q_tau'][a][b][c]` → same shape; thermal formulation only,
   per unit τ.
 - `result['Q_tilde']` is present but always empty.
@@ -641,6 +644,39 @@ cost is `16 * nk1*nk2 * nef` bytes per component *per rank*; the engine prints
 the size and warns above 512 MiB. Under MPI the gather restores grid order, so
 the output is identical to a serial run.
 
+**Three-piece decomposition.** `delta_Q_groups` splits the response the way
+`delta_Q_multiband_expansion.pdf` does:
+
+| group | what it is |
+|---|---|
+| `connection` | the shift-current matrix element `r^a_pq r^{c;b}_qp` with a `1/ω` weight |
+| `gap_gradient` | `∂_b(1/ω_pq) × r^a_pq r^c_qp`; in the metric part this is (gap gradient) × (two-state Berry curvature), i.e. the Berry-curvature-dipole piece |
+| `three_band` | closed three-band loops of position matrix elements; identically zero for a two-band model |
+
+The three sum to `delta_Q`. Read `Re` as the metric part `δg^{ab}` and `Im` as
+`-δΩ^{ab}/2`. Which engine term goes where is not obvious from the names —
+`T_Sipe_3band` is part of `connection`, not `three_band` — so use the grouping
+rather than adding term names by hand. For a result saved before 2026-09-25,
+rebuild it with `calc.delta_Q.group_terms(result['delta_Q_terms'][a][b][c])`.
+
+Two things to know before quoting a split:
+
+- `gap_gradient` vanishes identically whenever `a == c`, and its **BZ integral**
+  vanishes for any C3 crystal (in 2D it is a pseudovector in the free index).
+  It is 0.1% of MoS2 and exactly zero on the C3 honeycomb; break C3 and it
+  revives (8.9% under 30% uniaxial strain).
+- `connection` and `three_band` can cancel strongly — on MoS2 they are −18% and
+  +118% of `δQ_yyy`. The total is then far less sensitive to `eta_sos` than the
+  split is, so **converge `eta_sos` (≤ 1e-4 on MoS2) before reporting one**.
+
+`examples/dQ_term_groups.py <model>` prints the BZ-summed table:
+
+```
+python3 examples/dQ_term_groups.py honeycomb
+mpiexec -np 12 python3 examples/dQ_term_groups.py mos2 \
+    --mos2-dir /path/with/mos2_tb.dat --nk 200 --eta-sos 1e-4
+```
+
 **Reloading:**
 
 ```python
@@ -649,8 +685,9 @@ result, cfg = load_delta_Q('results/dQ')
 # result['delta_Q']['x']['z']['x'] — array(nef,)
 ```
 
-`load_delta_Q` returns `Q_tilde`, `delta_Q`, `delta_Q_terms`, and
-`delta_Q_tau` / `delta_Q_k` / `kpoints` / `nk_grid` when those were computed.
+`load_delta_Q` returns `Q_tilde`, `delta_Q`, `delta_Q_terms`,
+`delta_Q_groups`, and `delta_Q_tau` / `delta_Q_k` / `kpoints` / `nk_grid` when
+those were computed.
 
 **Sign convention.** The implemented formula corresponds to `H' = -E·r`. Notes
 written with `H' = +E·r` give the opposite overall sign; the two agree to

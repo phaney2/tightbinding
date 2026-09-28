@@ -114,6 +114,8 @@ Common workflow: user provides a PDF with derivations, Claude reads the equation
 - `examples/input_jdos_test.yaml` — joint density of states (2D square sp_u)
 - `examples/input_nonlinear_freq_integral.yaml` — analytic frequency-integrated chi^(2)
 - `examples/input_skewness_test.yaml` — polarization variance + skewness (gapped honeycomb)
+- `examples/liu_tmd/` — Liu et al. (PRB 88, 085433) three-band TMD models, NN/TNN, GGA/LDA,
+  as `System`s (`liu_model.liu_system`); `reproduce_table.py` reproduces the skewness paper's table
 - `examples/input_MoS2_bands.yaml` — MoS2 monolayer 11-band model (Mo d_u + S p_u, Cappelluti params)
 
 ## Validated Benchmarks
@@ -142,6 +144,10 @@ Common workflow: user provides a PDF with derivations, Claude reads the equation
   1e-15, finite differences of P(k) at h² convergence (incl. an exactly spin-degenerate model),
   the r/r^{b;c} band form at 1e-16, BZ total symmetry and C3 at 1e-13, variance == Q at 1e-16,
   gauge covariance at 6e-15 (control fails by 30-150%), MoS2 atomic vs lattice gauge 7e-15.
+- Skewness vs arXiv:2409.16358 SM Table S1 (`examples/liu_tmd/reproduce_table.py`): all 48
+  entries (variance and skewness; 6 TMDs x NN/TNN x GGA/LDA Liu three-band models) match
+  to the paper's 3 digits, with our skewness = −(paper's). MoS2 TNN-GGA: variance 0.27752,
+  skewness +0.11919 a³ (paper: 0.278, −0.119).
 
 ## chi^(2) No Longer Matches MATLAB (deliberately)
 As of `8b5a079`, the chi^(2) engine **diverges from the MATLAB original by design**. The port
@@ -455,6 +461,123 @@ so the cancellation theorem is exercised, not assumed); field+k finite-differenc
 certificate at 4e-7; RTA vs operator traces at 2e-16, TR selection rule to machine
 precision; insulator limit == subspace at 2e-16.
 
+### The three-piece decomposition (`delta_Q_multiband_expansion.pdf`)
+
+That note's Eq. 1 (metric part Eq. 17) splits δQ into (i) a **connection** piece
+i Σ r^a_pq r^{c;b}_qp/ω_pq, (ii) a **gap-gradient** piece i Σ ∂_b(1/ω_pq) r^a_pq r^c_qp,
+and (iii) **three-band** loops. **This is the same partition the engine already had** —
+only the names mislead. Verified piece by piece to 3e-16 (`examples/test_dQ_term_groups.py`,
+25 checks, both formulations, 2-band and 4-band insulators):
+
+| note piece | engine terms |
+|---|---|
+| (i) connection | `T_Sipe_Delta + T_Sipe_d2H + T_Sipe_3band + T_Sipe_wannier_corr` |
+| (ii) gap gradient / Berry-curvature dipole | `T_Delta` |
+| (iii) three-band | `T_3band` + `T_mix` (subspace) / + `T_loop` (thermal) |
+
+Two traps: **`T_Sipe_3band` belongs to (i)**, not (iii) — it is the three-band sum
+*inside* the Sipe generalized derivative; and the actual three-band loop is split
+across two or three term names by the occupation of the intermediate band. `T_Delta`
+is (ii) because Δ^b_pq = v^b_pp − v^b_qq is exactly ∂_b ω_pq.
+
+`compute_delta_Q` now returns `delta_Q_groups[a][b][c][group]` alongside
+`delta_Q_terms` (saved and reloaded); `calc.delta_Q.group_terms()` rebuilds it from
+the terms of an older file. Driver: `examples/dQ_term_groups.py <model>`.
+
+**All three pieces are separately gauge invariant, in both senses** — which is the
+point of grouping at all. Under the *band phase* gauge each is a closed loop of
+covariant objects (for (i) that is what the −i(ξ_nn−ξ_mm) term in the Sipe derivative
+is for): invariant to 9e-17. Under the *atompos / Bloch-phase convention*, with the
+correction on: invariant to 6e-15, while the correction-off control is off by 81%.
+The individual `T_*` terms are covariant under band phases but **not** under the
+convention — `T_Sipe_wannier_corr` moves by 33% between gauges while the (i) group
+does not move at all. That is what "the `T_Sipe_*` split is gauge-dependent" means,
+and the three groups are the coarsest partition that is physically meaningful.
+Note the corollary: **gauge invariance is not operator independence.** Toggling
+`wannier_r` is not a gauge transformation — it changes the position operator itself —
+so there is no tension with the sensitivity recorded above. On the real MoS2 file,
+dQ_yyy with the correction *on* is -0.335574 in both the atomic and the lattice gauge
+(identical to 6 digits); with it *off* it is -0.357864 vs -1.457000, **a factor of 4**.
+`wannier_r: false` on `_tb.dat` is the wrong operator and is only well-defined because
+the loader pins `atompos` to the Wannier centres — it means "replace each WF by a point
+at its centre", a 6.2% approximation in that convention and a factor-4 ambiguity without
+it. Quote the corrected result; the uncorrected one is a spread diagnostic only. (Inert,
+and exact, for TB_simple point-like orbitals.)
+
+*The note's own δQ = F^{ab} + F^{ba} is loose* — Tr[(D_aT_c)†R_b] is conj(F^{ba}),
+which is what its Eq. 18 for δΩ requires and what the engine computes. Eq. 17 (δg) is
+unaffected.
+
+**BZ-summed weights of the metric part** (|piece| / Σ|piece| over the nonzero
+components; `eta_sos` ≤ 1e-4, converged in nk):
+
+| model | (i) connection | (ii) gap gradient | (iii) three-band |
+|---|---|---|---|
+| gapped honeycomb, 2 bands, C3 | 100% | 0 | 0 (identically) |
+| same + 30% uniaxial strain (C3 broken) | 91% | 8.9% | 0 (identically) |
+| random 4-band, 2 occ, no point group | 89.6% | 2.3% | 8.1% |
+| **MoS2 Wannier, 7 occ, correction on** | **13.6%** | **0.1%** | **86.3%** |
+| MoS2, correction off | 50.8% | 0.6% | 48.6% |
+
+- **(ii) is zero whenever a = c** (pointwise: Im(r^a_pq r^c_qp) → Im|r^a|² = 0), and its
+  *BZ integral* vanishes for any C3 crystal — in 2D it is a pseudovector in the free
+  index. Hence ~0 on the C3 honeycomb and 0.1% on MoS2; breaking C3 revives it.
+- **(iii) dominates MoS2** — stronger than the note's "10–40% at generic k". δQ_yyy =
+  −0.33557 is (i) +0.06100 (−18.2%) + (iii) −0.39657 (+118.2%): the two pieces cancel.
+- **Quote the split only at small `eta_sos`.** The total is insensitive (−0.335528 at
+  `eta_sos` 0.05 vs −0.335574 at 1e-5) but the split is not: (i)/(iii) = 8.5/91.4% at
+  0.05, 13.6/86.3% at 1e-4, converged below that. The cancellation is what amplifies it.
+- `thermal` and `subspace` give identical splits on these insulators.
+- **Piece (i) on MoS2 is a 54x-cancelled residue** (pointwise rms 3.0, BZ average
+  0.056; the total cancels only 2.3x), because the pieces carry the large
+  intra-manifold position elements (rbar rms 1.77 A unocc-unocc, 0.91 A occ-occ vs
+  0.36 A occ-unocc) that cancel between them. So the *uniformly small* Wannier
+  correction (|a|/|rbar| = 17% occ-unocc, 3-4% intra-manifold) perturbs each piece
+  pointwise by rms 0.58 — ten times the surviving BZ average of (i) — which is why
+  (i) flips sign (-0.160 -> +0.061) while the total moves 6%. No other model shows
+  this: (i) and the total cancel by similar factors on the honeycomb, the Liu
+  models and a generic 4-band insulator. **Quote "the three-band piece dominates
+  MoS2", not the value of (i) to two digits** — it will move with the
+  Wannierization too. Full analysis: `NOTE_2026-09-26_dQ_term_decomposition.md` §5.4.
+
+**The pieces carry intra-manifold denominators that δQ does not.** δQ itself only ever
+sees occ–unocc gaps — (∂_aP)_pq and (δP)_qp both carry f_pq. The note's residual blocks
+(its Eq. 10) do not: `Σ_{q'≠q} r^a_pq' r^b_q'q` has **both indices unoccupied** and
+`Σ_{p'≠p} r^a_p'q r^b_pp'` has **both occupied**, so piece (iii) carries 1/ω within each
+manifold and piece (i) the equal-and-opposite ones inside the Sipe sum rule (whose
+intermediate index runs over all bands). They cancel pointwise. Consequence: **where two
+bands touch inside a manifold, each piece diverges as 1/|δk| and the total does not.**
+The cusp is absolutely integrable in 2D, so each piece still has a well-defined BZ
+integral, but a uniform grid converges only O(h) with a coefficient set by where the grid
+falls relative to the touching — so the split scatters at the 1e-3 level while the total
+is converged to 7 digits. The note never saw this (its own 4-band check had minimum band
+separation 0.079). Check an nk ladder before quoting a split, and expect non-monotone
+outliers rather than noise.
+
+### Liu three-band TMD models (`examples/liu_tmd/`)
+
+24 models, 1 occupied band — the smallest system in which piece (iii) exists at all.
+Full table and discussion: `examples/liu_tmd/RESULTS_dQ.md`; driver
+`examples/liu_tmd/dQ_table.py --nk 480,960`. δQ_yyy in a³, ef at midgap.
+
+| | δQ_yyy | (iii) weight |
+|---|---|---|
+| **TNN** (6 materials × GGA/LDA) | +0.076 … +0.147 | 1.3 – 12.5% |
+| **NN** | −0.015 … +0.006 | 40 – 98% |
+| MoTe2 TNN GGA (outlier) | −0.025 | 80% |
+
+- **(ii) is exactly zero in all 24** — to the last digit, as the a = c + C3 argument requires.
+- **NN and TNN are qualitatively different for δQ.** TNN is connection-dominated; NN is an
+  order of magnitude smaller, usually of the *opposite sign*, and is a near-cancellation
+  dominated by the three-band piece (WSe2 NN GGA: (i) = −0.00019 vs (iii) = −0.01135).
+  **Do not use the NN parameterization for δQ.**
+- **MoTe2 TNN is functional-unstable**: GGA −0.025 (iii 80%) vs LDA +0.114 (iii 8.6%),
+  where every other material agrees GGA/LDA to ~10%.
+- These models are *exactly* symmetric, unlike the MoS2 `_tb.dat` file: the C3 chain closes
+  to 1e-14…1e-16 and M_x-odd components are 1e-15…1e-16 of |yyy|.
+- Their two unoccupied bands cross conically at six points at |k| ≈ 2.12 — this is the
+  family that exposed the intra-manifold caveat above.
+
 **Overall sign vs. the +E·r convention.** Eq. 40 as implemented corresponds to H' = -E·r. Notes written with H' = +E·r (e.g. `tmd_warping_note_corrected.pdf`, Eq. 7) give the *opposite* overall sign. Verified pointwise: `delta_Q` output = -1.000000 x (that note's Eq. 7) at every k and every (a,b,c) channel. Magnitude and all structure agree to machine precision — only the global sign differs.
 
 **Gotchas for small-gap models.** `eta_sos` defaults to 0.05, which is comparable to (or larger than) the gap in low-energy models — set it to ~1e-8 whenever bands are never degenerate. Also set `eta: 0.0` to compare against unbroadened analytic results, and `kT` well below the gap.
@@ -505,12 +628,17 @@ which `_tb.dat` does not carry.
 converged to all digits at nk = 60):** correction on: variance xx = 3.48982, yy = 3.48171;
 skewness yyy = −1.02267, xxy = xyx = 1.01573, yxx = 1.03045 (fully symmetrized 1.02063), M_x-odd
 components ≤ 0.010. Correction off: xx = 3.74633, yy = 3.61813; yyy = −1.04120, xxy = 0.99315,
-M_x-odd ≤ 1e-5. The correction is a 4–7% effect on the variance, 2% on the skewness. **The C3
-breaking is the file's, not the engine's**: the Wannier centres are not on the atomic sites
-(the Mo-like WFs sit at y = 1.708…1.938 Å around Mo at 1.824, x = 0 exactly; S-like likewise),
-i.e. the WFs are M_x- but not C3-symmetric individually, so the point-like model is 3.5%
-anisotropic and even with the correction the chain yyy = −xxy holds only to ~1%. H(k) itself
-breaks C3 by only 5e-4 eV in band energies. A symmetry-adapted Wannierization would fix this.
+M_x-odd ≤ 1e-5. The correction is a 4–7% effect on the variance, 2% on the skewness (D3h
+projection κ = 1.0211 vs 1.0052). **The symmetry breaking is the file's, not the engine's**:
+the Wannier centres are not on the atomic sites (the Mo-like WFs sit at y = 1.708…1.938 Å
+around Mo at 1.824, x = 0 exactly; S-like likewise), so the centres respect M_x but not C3,
+and the point-like model is 3.5% anisotropic (C3 chain off by 4.7%). The correction repairs
+most of that (chain to 0.2%) but brings in ~1% **M_x** breaking (xxx ≈ xyy ≈ 0.01, xy
+variance 0.003) from the off-diagonal position blocks — with it off, M_x holds to 1e-5. H(k)
+itself breaks C3 by only 5e-4 eV in band energies. A symmetry-adapted Wannierization would fix
+both. **z components are nonsense on this file** (σ_h-forbidden zzz = 9.1 Å³, zz variance
+116 Å²) — run in-plane only. Full tables and re-runnable inputs: `examples/mos2_skewness/`
+(`RESULTS.md`, `input_wannier_r_{on,off}.yaml`).
 
 Config / output:
 ```yaml
