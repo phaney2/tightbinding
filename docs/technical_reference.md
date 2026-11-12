@@ -26,6 +26,7 @@ tightbinding/
 │   ├── wannier_gauge.py     # Wannier-gauge position correction: the switch + the kernel
 │   ├── quantum_metric.py    # Quantum metric tensor + linear response
 │   ├── delta_Q.py           # DC field-induced quantum geometric tensor change
+│   ├── skewness.py          # Polarization cumulants: variance + third cumulant
 │   └── jdos.py              # Joint density of states
 │
 ├── parallel.py                  # MPI wrapper (mpi4py, serial fallback)
@@ -72,6 +73,7 @@ _dispatch()            [main.py]
     │                         [calc/freq_integral.py]
     ├─ quantum_metric  → compute_quantum_metric()  [calc/quantum_metric.py]
     ├─ delta_Q         → compute_delta_Q()         [calc/delta_Q.py]
+    ├─ skewness        → compute_skewness()        [calc/skewness.py]
     └─ jdos            → compute_jdos()            [calc/jdos.py]
 ```
 
@@ -432,6 +434,9 @@ Routes to calculation engines based on `calc.type`:
 | `all_ek` | `compute_all_ek` | `calc.all_ek` |
 | `nonlinear_optical` | `compute_nonlinear_optical` | `calc.nonlinear_optical` |
 | `quantum_metric` | `compute_quantum_metric` | `calc.quantum_metric` |
+| `delta_Q` | `compute_delta_Q` | `calc.delta_Q` |
+| `skewness` | `compute_skewness` | `calc.skewness` |
+| `jdos` | `compute_jdos` | `calc.jdos` |
 | `kubo` | Not yet implemented | — |
 
 #### I/O Helpers
@@ -449,6 +454,16 @@ Result keys: `'Q'`, `'dQ'`, `'dQf'`, nested by direction labels.
 **`load_all_ek(path)`** — Returns `(result_dict, config_dict)`.
 Result keys: `'ndim'`, `'ekset'`, `'k_grid'`, `'dos_energies'`, `'dos_values'`,
 `'band_summary'`, `'band_gap'`.
+
+**`load_delta_Q(path)`** — Returns `(result_dict, config_dict)`.
+Result keys: `'Q_tilde'`, `'delta_Q'`, `'delta_Q_terms'`, `'delta_Q_groups'`,
+plus `'delta_Q_tau'` / `'delta_Q_k'` / `'kpoints'` / `'nk_grid'` when those
+were computed. Handles 1-, 3-, 4- and 5-part flattened keys.
+
+**`load_skewness(path)`** — Returns `(result_dict, config_dict)`.
+Result keys: `'variance'` (nested `[a][b]`), `'skewness'` and
+`'skewness_sym'` (nested `[a][b][c]`), `'gap'`, `'n_occ'`. All arrays real,
+shape `(nef,)`.
 
 ---
 
@@ -768,9 +783,9 @@ sampled-mode regression against a `git worktree` baseline passed as `argv[1]`).
 
 The single switch, kernel and application function for the Wannier-gauge
 position correction. Every engine that builds an `r` operator —
-`nonlinear_optical`, `nonlinear_optical_fast`, `delta_Q`, `quantum_metric` —
-goes through them, so they cannot drift apart. A new engine with a position
-operator must do the same.
+`nonlinear_optical`, `nonlinear_optical_fast`, `delta_Q`, `quantum_metric`,
+`skewness` — goes through them, so they cannot drift apart. A new engine with
+a position operator must do the same.
 
 #### `compute_A_W_k(system, k, dir_chars=None, enabled=True, need_deriv=True)`
 
@@ -820,6 +835,33 @@ vertex, the projector-derivative factors of the `subspace`/`band` delta_Q
 formulations and the perturbation vertex of `quantum_metric`; the bare v
 stays in Δ = v_nn - v_mm, the Sipe sum rule, the band curvature and the
 inverse-mass sum rule (all derivatives of H(k)).
+
+#### `covariant_H_derivatives(A_W, dA_W, H, vtb, dir_chars) -> (V, W)`
+
+The projector-engine entry point, used by `calc/skewness.py`. An engine that
+works with `P(k)` rather than band matrix elements does not want a corrected
+`r` at all — for it the entire Wannier-gauge correction is the single
+replacement `∂_a → D_a = ∂_a - i[A^(W)_a, ·]` on every N×N operator. `D_a`
+is a derivation, so every identity obtained by differentiating `[H, P] = 0`
+survives verbatim with `D` in place of `∂`, and the engine needs only
+
+```
+V^a    = ∂_a H - i [A_a, H]
+W^{bc} = ∂_b ∂_c H - i [∂_b A_c, H] - i [A_c, ∂_b H] - i [A_b, V^c]
+```
+
+returned in the **orbital** basis as `V[a]`, `W[b][c]`. In the band basis
+`V^a_nm = vbar^a_nm + i w_nm a^a_nm` with the diagonal bare — the same
+current vertex `apply_wannier_correction` returns — so this is the same
+physics in different bookkeeping, and the gauge-covariance certificate
+carries over unchanged (`examples/test_skewness.py`). With `A_W = None` the
+bare `vtb` derivatives are passed straight through.
+
+**`W^{bc}` is not symmetric in b↔c.** `[D_b, D_c] = -i[F_bc, ·]`, and a
+truncated Wannier basis generally has curvature `F ≠ 0` — the same `F` behind
+the `a ≠ c` χ^(2)/`delta_Q` sum-rule offset. This function does not
+symmetrize; the caller decides (`skewness` symmetrizes b↔c and reports the
+remainder).
 
 #### `resolve_wannier_r(cfg, system, engine) -> bool`
 
@@ -1040,6 +1082,98 @@ and `delta_Q_groups.<a>.<b>.<c>.<group>`, and the k-resolved output under
 `load_delta_Q` handles 1-, 3-, 4- and 5-part keys, so all of it round-trips.
 (Before 2026-09-13 the loader handled only 3- and 4-part keys and silently
 dropped `delta_Q_terms` on reload.)
+
+---
+
+### `calc/skewness.py`
+
+#### `compute_skewness(system, cfg) -> dict`
+
+Cumulants of the ground-state polarization per unit cell, arXiv:2409.16358
+Eqs. 12–13 with `P = P_occ(k)`:
+
+```
+<X_a X_b>_c      =  V ∫_k Re tr[ P (∂_a P)(∂_b P) ]        (= the quantum metric Q)
+<X_a X_b X_c>_c  = -V ∫_k Im tr[ P (∂_a P)(∂_b ∂_c P) ]
+```
+
+The `V` prefactor never appears in the code: with `∫_k = ∫d^dk/(2π)^d` and
+`V = (2π)^d / V_BZ`, `V ∫_k` *is* the plain BZ average, which is what the
+uniform `norm = 1/N_k` weight computes.
+
+**Why not r and r^{b;c}.** The obvious route — expand the traces in the
+position operator and its generalized derivative — brings in `1/ω` between
+two *occupied* bands, which cancels only algebraically and would therefore be
+destroyed by the Souza `eta_sos` regularization every other engine applies.
+Instead the engine differentiates `[H, P] = 0` in the band basis, with
+`f_pq = f_p - f_q` nonzero only on occupied–unoccupied pairs:
+
+```
+(∂_a P)_pq     = f_pq V^a_pq / (E_p - E_q)
+(∂_b ∂_c P)_pq = [ f_pq W^{bc}_pq - ([V^b, ∂_c P] + [V^c, ∂_b P])_pq ] / (E_p - E_q)
+```
+
+Only occ–unocc denominators survive, so there is nothing to regularize:
+`kT`, `eta`, `eta_sos` and `delta` are all ignored (`_IGNORED_KEYS`, one
+printed note each). The integrand is analytic and periodic, so the uniform
+grid converges **exponentially** — the error squares per `nk` doubling
+(honeycomb m = 0.1: 2e-2, 6e-4, 6e-7, 5e-13 at nk = 30/60/120/240).
+
+**At each k-point** (`_process_kpoint`):
+1. `get_H_v(order=2)` → H, S, `vtb` (first and second derivatives)
+2. Raise if `S ≠ 1` to 1e-12 — orthogonal basis only, NRL is unsupported
+3. `diagonalize_hk(eigenvectors=True)` → `ek`, `psi`
+4. `compute_A_W_k(..., need_deriv=True)` → `covariant_H_derivatives` → `V`,
+   `W` in the orbital basis, rotated to the band basis as `Vb`, `Wb`
+5. Per Fermi level: sharp `f = (ek < ef)`, build `fin = f_pq/(E_p-E_q)` on
+   the occ–unocc mask, then `D[a] = fin * Vb[a]` and
+   `DD = fin*Wb[b][c] - inv*C` with `C` the two commutators above
+6. Accumulate `tr[P X Y] = Σ_nm f_n X_nm Y_mn` as `Σ f[:,None] * X * Y.T`
+
+**Occupation bookkeeping.** `nocc_min` / `nocc_max` / `gap_min` are tracked
+per Fermi level and reduced across ranks. After the loop the engine
+**raises** if `nocc_min != nocc_max` (ef inside a band — the cumulants exist
+only for an insulator) or if `nocc == 0`. This is a hard error, not a
+warning; metals have no polarization distribution to take cumulants of.
+
+**Symmetrization.** The raw `T^{a;bc}` is reduced two ways:
+
+- `T_bc = ½(T + T.swapaxes(2,3))` → `skewness`, the reported value
+- the mean over all six permutations of (a,b,c) → `skewness_sym`
+
+Both antisymmetric remainders, `max|T - T_bc|` and `max|T_bc - T_sym|`, are
+printed with the `|T|` scale. For point-like orbitals both are exactly zero;
+on MoS2 Wannier input they are 1.4% and 1% of `|T|`, measuring the curvature
+`F_bc` of the Wannier connection (`[D_b, D_c] = -i[F_bc, ·]`, see
+`covariant_H_derivatives`). The b↔c symmetrization is therefore an
+`F`-sized *choice* on Wannier input, not an identity.
+
+**Sign.** `skewness = -Im(T)`, i.e. **minus** the paper's Eq. 13. The paper's
+Eq. 13 as literally written has the wrong sign relative to the real-space
+cumulant: on its own fully dimerized Rice–Mele chain the electron
+distribution is exactly Bernoulli on {0, ½} with
+`κ₃ = -m/(8(4+m²)^{3/2})`, while Eq. 13 gives `+m/(8(4+m²)^{3/2})`. Verified
+in this code's Bloch convention, which is the paper's. Decided 2026-09-21.
+
+**Returns** `{'variance', 'skewness', 'skewness_sym', 'gap', 'n_occ'}` —
+the first three nested by direction label, all arrays **real** of shape
+`(nef,)`; `gap` is the minimum direct gap over the grid per ef and `n_occ`
+the occupied-band count. Saved by `main._save_skewness`, read back by
+`main.load_skewness`.
+
+**Complexity** O(N³) per k-point (the commutators in step 5 are the N³
+part); memory is negligible — nothing per-k is retained.
+
+**Validation** — `examples/test_skewness.py`, 33 checks without MoS2 data:
+exact Bernoulli
+cumulants of the decoupled dimer at 1e-15, the paper's Rice–Mele (elliptic)
+and stub-SSH (three-band) closed forms at 1e-15, finite differences of P(k)
+at h² convergence, the r / r^{b;c} band form at 1e-16, BZ-total symmetry and
+C3 at 1e-13, `variance == Q` at 1e-16, gauge covariance at 6e-15 (the
+no-correction control fails by 30–150%), MoS2 atomic vs lattice gauge at
+7e-15. Pass a directory containing `mos2_tb.dat` as argv[1] for the
+real-data section. `examples/liu_tmd/reproduce_table.py` reproduces all 48
+entries of the paper's SM Table S1 to its 3 digits.
 
 ---
 

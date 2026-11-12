@@ -252,11 +252,13 @@ Wannier functions have a finite spread and off-diagonal dipoles, so the
 tight-binding form `r = -i v/ω` (exact for point-like orbitals) misses part
 of the position operator. `_tb.dat` carries the matrix elements `<0n|r|Rm>`
 that supply it; `wannier_r` switches that correction on and off for every
-engine that builds an `r` operator: `nonlinear_optical`, `delta_Q` and
-`quantum_metric`. One key, one meaning, all three engines. It corrects the
-interband `r`, its generalized derivative `r^{a;b}`, and the current vertex
-consistently, and the whole thing is checked by an exact gauge-covariance
-test (`examples/test_wannier_gauge.py`).
+engine that builds an `r` operator: `nonlinear_optical`, `delta_Q`,
+`quantum_metric` and `skewness`. One key, one meaning, every engine. It
+corrects the interband `r`, its generalized derivative `r^{a;b}`, and the
+current vertex consistently, and the whole thing is checked by an exact
+gauge-covariance test (`examples/test_wannier_gauge.py`). `skewness` works
+with projectors rather than band matrix elements, so it takes the same
+correction in the equivalent form `∂_a → ∂_a - i[A^W_a, ·]`.
 
 `false` keeps the point-like-orbital approximation (in the atomic gauge, so
 the intra-cell phases are still right). It is a diagnostic setting; both
@@ -697,6 +699,102 @@ machine precision in magnitude and structure at every k and every channel.
 comparable to or larger than the gap in low-energy models — set it to ~`1e-8`
 whenever bands are never degenerate. Set `eta: 0.0` to compare against
 unbroadened analytic results, and keep `kT` well below the gap.
+
+### Polarization Cumulants (`skewness`)
+
+Computes the first two nontrivial cumulants of the ground-state electronic
+polarization per unit cell — the variance (second cumulant) and the skewness
+(third cumulant) — as BZ averages of traces over the occupied projector
+`P = P_occ(k)` (arXiv:2409.16358 Eqs. 12–13):
+
+```
+variance^{ab}  = <X_a X_b>_c      =  V ∫_k Re tr[ P (∂_a P)(∂_b P) ]
+skewness^{abc} = <X_a X_b X_c>_c  = -V ∫_k Im tr[ P (∂_a P)(∂_b ∂_c P) ]
+```
+
+The variance is the same object as the quantum metric `Q` from
+`calc.type: quantum_metric` (they agree to 1e-16). The skewness is the new
+content: it measures the asymmetry of the electron distribution within the
+cell. With positions in Å, the variance is in Å² and the skewness in Å³.
+
+```yaml
+calc:
+  type: skewness
+  nk: [240, 240]          # 2 or 3 entries
+  eflist: [0.0]           # Fermi levels — must lie in a gap
+  directions: [x, y]      # optional, default [x, y]
+  outputfile: results/skew
+```
+
+**Insulators only.** Occupation is sharp (`E < ef`) and the engine **raises**
+if the occupied count varies across the grid, or if no band is occupied —
+the polarization cumulants are not defined for a metal. Put `ef` in a gap.
+An orthogonal basis is required; NRL input (with overlap `S ≠ 1`) raises.
+
+**No broadening, regularization or temperature.** `kT`, `eta`, `eta_sos` and
+`delta` are all **ignored**, with a printed note if you pass them. There is
+nothing for them to regularize: the formula is built by differentiating
+`[H, P] = 0` in the band basis, so only occupied–unoccupied denominators ever
+appear, and the integrand is an analytic periodic function of k.
+
+**Convergence is exponential**, not power-law — the error roughly *squares*
+each time you double `nk`. On the gapped honeycomb at m = 0.1 the error runs
+2e-2, 6e-4, 6e-7, 5e-13 at `nk` = 30/60/120/240. Converged results usually
+need a far coarser grid than a response function does (MoS2 is converged to
+all printed digits at `nk = 60`); check a doubling rather than assuming.
+Cost is O(N³) per k-point.
+
+**Sign convention.** The engine reports the real-space cumulant, which is
+**minus** the paper's Eq. 13. To compare against their tables, flip the sign
+of the skewness: their MoS2 TNN-GGA `Skew = −0.119 a³` is `+0.119` here.
+Negative skewness means weight piled up toward +x with the tail toward −x.
+The fix was pinned against the exactly Bernoulli distribution of the paper's
+own fully dimerized Rice–Mele chain.
+
+**Wannier input.** The correction enters as `∂_a → D_a = ∂_a - i[A^W_a, ·]`
+(see [`wannier_r`](#wannier_r--the-wannier-gauge-position-correction)), so
+the result does not depend on the orbital centres the system was built with.
+Two caveats specific to this engine:
+
+- A truncated Wannier basis has a connection with curvature `F_bc`, so
+  `D_b D_c ≠ D_c D_b` and the raw `T^{a;bc}` is not symmetric in b↔c. The
+  engine symmetrizes b↔c, also returns the fully symmetrized
+  `skewness_sym`, and **prints both antisymmetric remainders** — exactly
+  zero for point-like orbitals, 1.4% and 1% of `|T|` on MoS2. Check those
+  printed numbers before quoting a component.
+- This is the cumulant of the position operator *projected onto the Wannier
+  manifold*. The exact many-body cumulant needs `<0n|r_a r_b|Rm>` matrix
+  elements, which a `_tb.dat` file does not carry.
+
+**Output:**
+- `result['variance'][a][b]` → **real** array of shape `(nef,)`
+- `result['skewness'][a][b][c]` → real array `(nef,)`, b↔c symmetrized
+- `result['skewness_sym'][a][b][c]` → real array `(nef,)`, averaged over all
+  six index permutations
+- `result['gap']` → `(nef,)`, minimum direct gap over the grid
+- `result['n_occ']` → `(nef,)` int, number of occupied bands
+
+**Reloading:**
+
+```python
+from tightbinding.main import load_skewness
+result, cfg = load_skewness('results/skew')
+# result['variance']['x']['x']        — array(nef,)
+# result['skewness']['y']['y']['y']   — array(nef,)
+```
+
+**Worked example:** `examples/input_skewness_test.yaml` (gapped honeycomb).
+Test suite: `examples/test_skewness.py` — 33 checks including exact Bernoulli
+cumulants, the paper's Rice–Mele and stub-SSH closed forms at 1e-15, finite
+differences of P(k), and gauge covariance. Pass a directory containing
+`mos2_tb.dat` as argv[1] to add the real-data section.
+
+> **Out-of-plane components on a 2D Wannier file are usually nonsense.** On
+> the MoS2 `_tb.dat` file the σ_h-forbidden `zzz` comes out at 9.1 Å³ and the
+> `zz` variance at 116 Å², because the Mo centre sits on the Berry-phase
+> branch cut and its z position matrix elements are garbage (see the loader
+> note under [Wannier90 Input](#wannier90-input)). Run in-plane only unless
+> you have checked the z blocks.
 
 ### Joint Density of States (`jdos`)
 
